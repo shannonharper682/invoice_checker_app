@@ -1,0 +1,12 @@
+command:
+  - sh
+  - -c
+  - streamlit run app.py --server.headless true --server.address 0.0.0.0 --server.port ${DATABRICKS_APP_PORT:-8000}
+env:
+  - name: WAREHOUSE_ID
+    value: "a43b344f78062807"
+resources:
+  - name: sql-warehouse
+    sql_warehouse:
+      id: a43b344f78062807
+      permission: CAN_USE

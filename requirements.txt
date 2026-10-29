@@ -1,0 +1,5 @@
+streamlit
+pandas
+databricks-sdk
+openpyxl
+reportlab
