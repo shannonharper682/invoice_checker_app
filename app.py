@@ -14,7 +14,7 @@ from databricks.sdk.core import Config
 SCHEMA = "ms_vulcan_gpgtopm_plab.belgium_app_demo_v1"
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.4.0"
+BASE_VERSION = "1.4.1"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -1057,6 +1057,8 @@ with t4:
                 view[c]=view[c].apply(_n2)
             view["run_timestamp"]=view["run_timestamp"].apply(_ts_label)
             view["check_month"]=view["check_month"].apply(_fmt_month)
+            view=view.drop(columns=["run_id"])  # run id is already in the Run timestamp filter label
+            view["endur_deal_numbers"]=view["endur_deal_numbers"].fillna("")
             view["flag_detail"]=view["flag_detail"].fillna("").str.replace("\u26a0\ufe0f","",regex=False).str.strip()
             view["comment"]=view["comment"].fillna("")
             view=view.set_index("flag_id")
@@ -1068,7 +1070,6 @@ with t4:
                 column_config={
                     "endur_deal_numbers":st.column_config.TextColumn("Endur Deal Numbers"),
                     "run_timestamp":st.column_config.TextColumn("Run timestamp"),
-                    "run_id":st.column_config.TextColumn("Run"),
                     "check_month":st.column_config.TextColumn("Invoice month"),
                     "period":st.column_config.TextColumn("Period"),
                     "type":st.column_config.TextColumn("Check"),
