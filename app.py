@@ -559,7 +559,7 @@ def _gs(eq,gap,label="Endur"):
     if gap is not None and abs(gap)<1: return "OK"
     return f"\u0394 {gap:+,.2f} EUR" if gap is not None else "Unknown"
 
-def save_results(lc,lf,als,alf,ahf,vfs,vff,eis,eif,df_all,inv_m,ck,inv_file,ack,sck,log):
+def save_results(lc,lf,als,alf,ahf,vfs,vff,eis,eif,df_all,inv_m,ck,inv_file,ack,sck,log,rid=None,run_by=None):
     # ack = arrears month (VF + EiC, detected from gas days); sck = allocation settlement month
     ts=datetime.utcnow().isoformat(); inv_m1=(inv_m.replace(day=1)-timedelta(days=1)).replace(day=1)
     ar,af=[],[]
@@ -623,8 +623,86 @@ def save_results(lc,lf,als,alf,ahf,vfs,vff,eis,eif,df_all,inv_m,ck,inv_file,ack,
     log(f"Saving: be_m={len(mr)}, be_m-1={len(m1r)}, be_m-3={len(m3r)}, alloc={len(asb)}")
     _sv("be_m",mr); _sv("be_m_minus_1",m1r); _sv("be_m_minus_3",m3r); _sv("be_alloc",asb); _sv("be_other",orr)
     _sv("be_m_flagged",mf); _sv("be_m_minus_1_flagged",m1f); _sv("be_m_minus_3_flagged",m3f); _sv("be_alloc_flagged",afv)
+    # --- Run history: snapshot of summaries + every flag, keyed by run_id / run_timestamp (append-only) ---
+    hs,hf=[],[]
+    for per,rows in (("M",mr),("M-1",m1r),("M-3",m3r),("Alloc",asb),("Other",orr)):
+        for r in rows:
+            h={k:r.get(k) for k in ("check_month","invoice_file","invoice_month","billing_month","type","product_name","location","direction","invoice_eur","invoice_volume","equinor_eur","equinor_volume","diff_eur","diff_pct","status")}
+            h.update(run_id=rid,run_timestamp=ts,period=per); hs.append(h)
+    for per,rows in (("M",mf),("M-1",m1f),("M-3",m3f),("Alloc",afv)):
+        for r in rows:
+            h={k:r.get(k) for k in ("check_month","invoice_file","billing_month","type","gas_day","location","direction","invoice_value","equinor_value","diff","diff_pct","unit","flag_detail")}
+            h.update(flag_id=str(uuid.uuid4()),run_id=rid,run_timestamp=ts,run_by=run_by,period=per); hf.append(h)
+    if rid:
+        def _ins(tbl,rows):
+            if not rows: return
+            df=pd.DataFrame(rows); cs=df.columns.tolist()
+            vs=["("+",".join(sql_lit(r[c]) for c in cs)+")" for _,r in df.iterrows()]
+            for i in range(0,len(vs),200):
+                exec_sql(f"INSERT INTO {SCHEMA}.{tbl} ({','.join(cs)}) VALUES {','.join(vs[i:i+200])}")
+        log(f"Saving run history: {len(hs)} summary rows, {len(hf)} flags")
+        _ins("be_runhistory_summary",hs); _ins("be_runhistory",hf)
     log("All results saved.")
-    return dict(be_m=len(mr),be_m_minus_1=len(m1r),be_m_minus_3=len(m3r),be_alloc=len(asb),flags=len(mf)+len(m1f)+len(m3f)+len(afv))
+    counts=dict(be_m=len(mr),be_m_minus_1=len(m1r),be_m_minus_3=len(m3r),be_alloc=len(asb),flags=len(mf)+len(m1f)+len(m3f)+len(afv))
+    return counts,hf,ts
+
+# === DISPLAY HELPERS ===
+def _num(v):
+    try:
+        f=float(v)
+        return None if pd.isna(f) else f
+    except (TypeError,ValueError): return None
+
+def _n2(v):
+    f=_num(v)
+    return "" if f is None else f"{f:,.2f}"
+
+def describe_flag(f):
+    """One-line, human-readable description of a flag row."""
+    fd=str(f.get("flag_detail") or "").replace("\u26a0\ufe0f","").strip()
+    where=" ".join(x for x in [str(f.get("direction") or ""),str(f.get("location") or "")] if x).strip()
+    s=f"{f.get('type','')}"+(f" | {where}" if where else "")+f" ({f.get('gas_day','')}): {fd}"
+    iv,ev,dp=_n2(f.get("invoice_value")),_n2(f.get("equinor_value")),_n2(f.get("diff_pct"))
+    u=str(f.get("unit") or "")
+    if iv or ev: s+=f" \u2014 invoice {iv or 'n/a'} vs Equinor {ev or 'n/a'} {u}".rstrip()
+    if dp: s+=f" ({dp}%)"
+    return s
+
+def _sc(val):
+    if val and ("OK" in str(val) or "VERIFIED" in str(val)): return "background-color:#c8e6c9"
+    if val and ("D " in str(val) or "\u0394" in str(val) or "REVIEW" in str(val) or "No" in str(val)): return "background-color:#ffcdd2"
+    return ""
+
+def styled(df, num_cols, status_cols=()):
+    """Thousands separators + 2 dp on numeric columns; colour status/verdict cells."""
+    sty=df.style.format({c:"{:,.2f}" for c in num_cols}, na_rep="")
+    if status_cols: sty=sty.map(_sc, subset=list(status_cols))
+    return sty
+
+def _fmt_month(m):
+    try: return pd.to_datetime(m).strftime("%B %Y")
+    except Exception: return str(m)
+
+def _ts_label(t):
+    try: return pd.to_datetime(t).strftime("%Y-%m-%d %H:%M:%S")+" UTC"
+    except Exception: return str(t)
+
+def render_run_summary(lr):
+    st.subheader("Verification summary")
+    st.caption(f"Run {lr['rid']} \u00b7 {_ts_label(lr['ts'])} \u00b7 {lr['bill']}")
+    fl=lr["flags"]
+    if not fl:
+        st.success("No flagged issues \u2014 every check matched within tolerance.")
+        return
+    st.error(f"{len(fl)} flagged issue(s) found. Review below, then add comments in the Run History tab.")
+    cnt=pd.DataFrame(fl).groupby(["period","type"]).size().reset_index(name="flags")
+    cnt["period"]=pd.Categorical(cnt["period"],["M","M-1","M-3","Alloc"],ordered=True)
+    st.dataframe(cnt.sort_values(["period","type"]),hide_index=True)
+    shown=fl[:30]
+    st.markdown("\n".join(f"- **{f['period']}** \u00b7 {describe_flag(f)}" for f in shown))
+    if len(fl)>30:
+        with st.expander(f"Show remaining {len(fl)-30} flags"):
+            st.markdown("\n".join(f"- **{f['period']}** \u00b7 {describe_flag(f)}" for f in fl[30:]))
 
 # === EXCEL EXPORT ===
 def build_results_excel(sections, month_label):
@@ -652,6 +730,9 @@ def build_results_excel(sections, month_label):
                     row += 1
                 else:
                     df.to_excel(xw, sheet_name=sheet, index=False, startrow=row - 1)
+                    for ci, col in enumerate(df.columns, start=1):  # thousands separator + 2 dp
+                        if pd.api.types.is_numeric_dtype(df[col]):
+                            for ri in range(len(df)): ws.cell(row=row + 1 + ri, column=ci).number_format = "#,##0.00"
                     for ci in range(1, len(df.columns) + 1):
                         c = ws.cell(row=row, column=ci); c.fill = hdr_fill[kind]
                         c.font = Font(bold=True, color="FFFFFF"); c.alignment = Alignment(wrap_text=True)
@@ -671,7 +752,11 @@ def build_results_excel(sections, month_label):
 
 # === STREAMLIT UI ===
 st.title("Belgium Invoice Checker")
-t1,t2,t3 = st.tabs(["Upload Invoices","Run Check","Results"])
+t1,t2,t3,t4 = st.tabs(["Upload Invoices","Run Check","Results","Run History"])
+
+def _user_email():
+    h=st.context.headers
+    return h.get("x-forwarded-email") or h.get("x-forwarded-preferred-username") or "app_user"
 
 with t1:
     st.header("Upload Invoice XML Files")
@@ -736,13 +821,17 @@ with t2:
                     log("No allocation settlement entries on this bill - skipping"); als,alf,ahf=[],[],False
                 log("Step 3/5: Variable Fee..."); vfs,vff=check_vf(df_all,am,aend,ack,log)
                 log("Step 4/5: Energy in Cash..."); eis,eif=check_eic(df_all,am,aend,ack,log)
-                log("Step 5/5: Saving..."); counts=save_results(lc,lfl,als,alf,ahf,vfs,vff,eis,eif,df_all,inv_m,ckm,bf,ack,P["sck"],log)
+                log("Step 5/5: Saving..."); counts,run_flags,run_ts=save_results(lc,lfl,als,alf,ahf,vfs,vff,eis,eif,df_all,inv_m,ckm,bf,ack,P["sck"],log,rid=rid,run_by=_user_email())
                 exec_sql(f"UPDATE {SCHEMA}.invoice_register SET last_checked_at=CURRENT_TIMESTAMP(),last_check_status='COMPLETE' WHERE file_name='{bf.replace(chr(39),chr(39)+chr(39))}'")
                 fin=datetime.utcnow(); tr=sum(counts.values())
                 exec_sql(f"INSERT INTO {SCHEMA}.run_log (run_id,invoice_file,selfbill_file,invoice_month,started_at,finished_at,run_by,status,message,rows_written) VALUES ('{rid}','{bf.replace(chr(39),chr(39)+chr(39))}',{sql_lit(sf)},'{inv_m}','{started.isoformat()}','{fin.isoformat()}','app_user','SUCCESS','be_m={counts['be_m']},m-1={counts['be_m_minus_1']},m-3={counts['be_m_minus_3']},alloc={counts['be_alloc']},flags={counts['flags']}',{tr})")
                 log(f"Done. Run {rid}: {tr} rows saved.")
-                st.success(f"Check complete. {tr} rows written. Switch to Results tab.")
+                st.success(f"Check complete. {tr} rows written. Full detail in the Results tab; comments in Run History.")
                 for k in [k for k in st.session_state if str(k).startswith("xlsx_")]: del st.session_state[k]  # drop stale Excel exports
+                st.session_state["last_run"]=dict(rid=rid,ts=run_ts,bill=bf,month=str(sm),flags=run_flags)
+        lr=st.session_state.get("last_run")
+        if lr and lr.get("month")==str(sm):
+            st.divider(); render_run_summary(lr)
 
 with t3:
     st.header("Invoice Check Results")
@@ -751,19 +840,31 @@ with t3:
     am=sorted(md["check_month"].tolist(),reverse=True) if len(md)>0 else []
     if not am: st.info("No results yet. Run a check first.")
     else:
-        def fmt(m):
-            try: return pd.to_datetime(m).strftime("%B %Y")
-            except: return str(m)
+        fmt=_fmt_month
         mm={fmt(m):m for m in am}
         sl=st.multiselect("Invoice Month",list(mm.keys()),default=[list(mm.keys())[0]])
         sms=[mm[l] for l in sl]
         if not sms: st.warning("Select at least one month.")
         else:
             mf=",".join(f"'{m}'" for m in sms)
-            def _sc(val):
-                if val and ("OK" in str(val) or "VERIFIED" in str(val)): return "background-color:#c8e6c9"
-                if val and ("D " in str(val) or "\u0394" in str(val) or "REVIEW" in str(val) or "No" in str(val)): return "background-color:#ffcdd2"
-                return ""
+            # --- Run selector: latest run by default, previous runs from run history ---
+            src_run=None; run_lbl=""
+            if len(sms)==1:
+                runs=run_sql(f"SELECT run_id, MAX(run_timestamp) AS ts FROM {SCHEMA}.be_runhistory_summary WHERE check_month='{sms[0]}' GROUP BY run_id ORDER BY ts DESC")
+                if len(runs)>0:
+                    labels=[_ts_label(t)+(" (latest)" if i==0 else "")+f"  \u00b7  run {r}" for i,(r,t) in enumerate(zip(runs["run_id"],runs["ts"]))]
+                    pick=st.selectbox("Run timestamp",labels,index=0,help="Defaults to the most recent run. Pick an earlier run to see how results changed.")
+                    src_run=runs["run_id"].iloc[labels.index(pick)]; run_lbl=pick
+                else:
+                    st.caption("No run history for this month yet (results pre-date run history). Showing current results.")
+            else:
+                st.caption("Showing the latest results. Select a single month to view previous runs.")
+            def S(tbl,per):
+                if src_run: return f"(SELECT * FROM {SCHEMA}.be_runhistory_summary WHERE run_id='{src_run}' AND period='{per}') t"
+                return f"(SELECT * FROM {SCHEMA}.{tbl} WHERE check_month IN ({mf})) t"
+            def F(tbl,per):
+                if src_run: return f"(SELECT * FROM {SCHEMA}.be_runhistory WHERE run_id='{src_run}' AND period='{per}') t"
+                return f"(SELECT * FROM {SCHEMA}.{tbl} WHERE check_month IN ({mf})) t"
             sections=[]  # collected for the Excel export: (title, caption, summary_df, flagged_title, flagged_df)
             def show(title,caption,ssql,fsql,ft):
                 st.markdown(f"## {title}"); st.caption(caption)
@@ -771,38 +872,37 @@ with t3:
                 if len(ds)>0:
                     nc=[c for c in ds.columns if any(k in c.lower() for k in ["eur","kwh","volume","diff","pct","gap"])]
                     ds=to_num(ds,nc); sc=[c for c in ds.columns if "status" in c.lower() or "verdict" in c.lower()]
-                    if sc: st.dataframe(ds.style.map(_sc,subset=sc),use_container_width=True,hide_index=True)
-                    else: st.dataframe(ds,use_container_width=True,hide_index=True)
+                    st.dataframe(styled(ds,nc,sc),use_container_width=True,hide_index=True)
                 else: st.info("No data.")
                 st.markdown(f"### {ft}")
                 df=run_sql(fsql)
                 if len(df)>0:
                     nc=[c for c in df.columns if any(k in c.lower() for k in ["value","diff","pct","gap"])]
-                    df=to_num(df,nc); st.dataframe(df,use_container_width=True,hide_index=True)
+                    df=to_num(df,nc); st.dataframe(styled(df,nc),use_container_width=True,hide_index=True)
                 else: st.success("No flagged issues.")
                 sections.append((title,caption,ds,ft,df))
             show("Capacity M","Capacity bookings where the billing month equals the invoice month.",
-                f"SELECT invoice_month,billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {SCHEMA}.be_m WHERE check_month IN ({mf}) ORDER BY direction,location",
-                f"SELECT gas_day,direction,location,type AS booking_type,invoice_value,equinor_value,diff AS gap,diff_pct AS gap_pct,flag_detail AS note FROM {SCHEMA}.be_m_flagged WHERE check_month IN ({mf}) ORDER BY gas_day",
+                f"SELECT invoice_month,billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {S('be_m','M')} ORDER BY direction,location",
+                f"SELECT gas_day,direction,location,type AS booking_type,invoice_value,equinor_value,diff AS gap,diff_pct AS gap_pct,flag_detail AS note FROM {F('be_m_flagged','M')} ORDER BY gas_day",
                 "Capacity M - Flagged Issues")
             st.divider()
             show("Capacity M-1","Capacity bookings where the billing month is one month prior to the invoice month.",
-                f"SELECT invoice_month,billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {SCHEMA}.be_m_minus_1 WHERE check_month IN ({mf}) ORDER BY direction,location",
-                f"SELECT gas_day,direction,location,type AS booking_type,invoice_value,equinor_value,diff AS gap,diff_pct AS gap_pct,flag_detail AS note FROM {SCHEMA}.be_m_minus_1_flagged WHERE check_month IN ({mf}) ORDER BY gas_day",
+                f"SELECT invoice_month,billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {S('be_m_minus_1','M-1')} ORDER BY direction,location",
+                f"SELECT gas_day,direction,location,type AS booking_type,invoice_value,equinor_value,diff AS gap,diff_pct AS gap_pct,flag_detail AS note FROM {F('be_m_minus_1_flagged','M-1')} ORDER BY gas_day",
                 "Capacity M-1 - Flagged Issues")
             st.divider()
             show("Variable Fees M-3","Variable fees and energy in cash for the invoice month (gas month is M-3).",
-                f"SELECT invoice_month,billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,diff_pct AS qty_diff_pct,status AS verdict FROM {SCHEMA}.be_m_minus_3 WHERE check_month IN ({mf}) ORDER BY type",
-                f"SELECT gas_day,type AS line_type,location,direction,invoice_value,equinor_value,diff,diff_pct,unit,flag_detail AS flag FROM {SCHEMA}.be_m_minus_3_flagged WHERE check_month IN ({mf}) ORDER BY gas_day",
+                f"SELECT invoice_month,billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,diff_pct AS qty_diff_pct,status AS verdict FROM {S('be_m_minus_3','M-3')} ORDER BY type",
+                f"SELECT gas_day,type AS line_type,location,direction,invoice_value,equinor_value,diff,diff_pct,unit,flag_detail AS flag FROM {F('be_m_minus_3_flagged','M-3')} ORDER BY gas_day",
                 "Variable Fees M-3 - Flagged Issues")
             st.divider()
             show("Self Bill","Sales H Grid (allocation settlement)",
-                f"SELECT invoice_month,billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,status AS verdict FROM {SCHEMA}.be_alloc WHERE check_month IN ({mf})",
-                f"SELECT gas_day,invoice_value,equinor_value,diff,diff_pct,flag_detail AS flag FROM {SCHEMA}.be_alloc_flagged WHERE check_month IN ({mf}) ORDER BY gas_day",
+                f"SELECT invoice_month,billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,status AS verdict FROM {S('be_alloc','Alloc')}",
+                f"SELECT gas_day,invoice_value,equinor_value,diff,diff_pct,flag_detail AS flag FROM {F('be_alloc_flagged','Alloc')} ORDER BY gas_day",
                 "Sales H Grid - Flagged Issues")
             st.divider()
             ml=", ".join(sl)
-            xkey="xlsx_"+"|".join(sms)
+            xkey="xlsx_"+"|".join(sms)+(f"|{src_run}" if src_run else "")
             if st.button("Prepare download"):
                 with st.spinner("Building Excel file..."):
                     st.session_state[xkey]=build_results_excel(sections,ml)
@@ -810,3 +910,71 @@ with t3:
                 st.download_button("Download Excel",st.session_state[xkey],
                     file_name=f"Belgium_Invoice_Check_{ml.replace(' ','_').replace(',','')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+with t4:
+    st.header("Run History")
+    st.caption("Every flagged issue from every Run Check. Filter by month and run, type a comment, then click Save comments.")
+    rh=run_sql(f"SELECT run_id, MAX(run_timestamp) AS ts, MAX(check_month) AS check_month, MAX(invoice_file) AS invoice_file FROM {SCHEMA}.be_runhistory_summary GROUP BY run_id ORDER BY ts DESC")
+    if len(rh)==0:
+        st.info("No runs recorded yet. Each Run Check from now on is saved here.")
+    else:
+        c1,c2=st.columns(2)
+        mopts=sorted(rh["check_month"].dropna().unique(),reverse=True)
+        msel=c1.multiselect("Invoice month",mopts,format_func=_fmt_month,placeholder="All months")
+        rsub=rh[rh["check_month"].isin(msel)] if msel else rh
+        rlab={f"{_ts_label(t)}  \u00b7  {_fmt_month(m)}  \u00b7  run {r}":r for r,t,m in zip(rsub["run_id"],rsub["ts"],rsub["check_month"])}
+        rsel=c2.multiselect("Run timestamp",list(rlab.keys()),placeholder="All runs")
+        conds=[]
+        if msel: conds.append("check_month IN ("+",".join(sql_lit(m) for m in msel)+")")
+        if rsel: conds.append("run_id IN ("+",".join(sql_lit(rlab[l]) for l in rsel)+")")
+        where=("WHERE "+" AND ".join(conds)) if conds else ""
+        hist=run_sql(f"SELECT flag_id,run_timestamp,run_id,check_month,period,type,gas_day,location,direction,invoice_value,equinor_value,diff,diff_pct,unit,flag_detail,comment,comment_by,comment_at FROM {SCHEMA}.be_runhistory {where} ORDER BY run_timestamp DESC, period, type, gas_day")
+        nruns=len(rsel) if rsel else len(rsub)
+        m1,m2,m3=st.columns(3)
+        m1.metric("Runs",nruns); m2.metric("Flagged issues",len(hist))
+        m3.metric("Commented",int(hist["comment"].fillna("").str.strip().ne("").sum()) if len(hist)>0 else 0)
+        if len(hist)==0:
+            st.success("No flagged issues for the selected run(s).")
+        else:
+            view=hist.copy()
+            for c in ("invoice_value","equinor_value","diff","diff_pct"):  # read-only display: commas + 2 dp
+                view[c]=view[c].apply(_n2)
+            view["run_timestamp"]=view["run_timestamp"].apply(_ts_label)
+            view["check_month"]=view["check_month"].apply(_fmt_month)
+            view["flag_detail"]=view["flag_detail"].fillna("").str.replace("\u26a0\ufe0f","",regex=False).str.strip()
+            view["comment"]=view["comment"].fillna("")
+            view=view.set_index("flag_id")
+            orig=view["comment"].copy()
+            editable={"comment"}
+            ekey="rh_editor_"+str(abs(hash((tuple(msel),tuple(rsel)))))
+            ed=st.data_editor(view,key=ekey,use_container_width=True,hide_index=True,
+                disabled=[c for c in view.columns if c not in editable],
+                column_config={
+                    "run_timestamp":st.column_config.TextColumn("Run timestamp"),
+                    "run_id":st.column_config.TextColumn("Run"),
+                    "check_month":st.column_config.TextColumn("Invoice month"),
+                    "period":st.column_config.TextColumn("Period"),
+                    "type":st.column_config.TextColumn("Check"),
+                    "gas_day":st.column_config.TextColumn("Gas day / month"),
+                    "invoice_value":st.column_config.TextColumn("Invoice"),
+                    "equinor_value":st.column_config.TextColumn("Equinor"),
+                    "diff":st.column_config.TextColumn("Diff"),
+                    "diff_pct":st.column_config.TextColumn("Diff %"),
+                    "flag_detail":st.column_config.TextColumn("Flag",width="large"),
+                    "comment":st.column_config.TextColumn("Comment",width="large",help="Type a comment, then click Save comments"),
+                    "comment_by":st.column_config.TextColumn("Comment by"),
+                    "comment_at":st.column_config.TextColumn("Comment at"),
+                })
+            if st.button("Save comments",type="primary"):
+                newc=ed["comment"].fillna("").astype(str)
+                changed=newc[newc.str.strip()!=orig.reindex(newc.index).fillna("").astype(str).str.strip()]
+                if len(changed)==0:
+                    st.info("No comment changes to save.")
+                else:
+                    vals=",".join(f"({sql_lit(fid)},{sql_lit(c.strip() or None)})" for fid,c in changed.items())
+                    exec_sql(f"MERGE INTO {SCHEMA}.be_runhistory t USING (SELECT flag_id, CAST(comment AS STRING) AS comment FROM VALUES {vals} AS s(flag_id,comment)) s "
+                             f"ON t.flag_id=s.flag_id WHEN MATCHED THEN UPDATE SET t.comment=s.comment, t.comment_by={sql_lit(_user_email())}, t.comment_at=current_timestamp()")
+                    st.session_state["rh_saved_msg"]=f"Saved {len(changed)} comment(s)."
+                    st.rerun()
+            if st.session_state.get("rh_saved_msg"):
+                st.success(st.session_state.pop("rh_saved_msg"))
