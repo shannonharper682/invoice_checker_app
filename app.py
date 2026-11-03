@@ -14,7 +14,7 @@ from databricks.sdk.core import Config
 SCHEMA = "ms_vulcan_gpgtopm_plab.belgium_app_demo_v1"
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.3.1"
+BASE_VERSION = "1.4.0"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -30,14 +30,20 @@ TRADING_FEE_RATE = 0.00195
 PRICE_DATA_PACKAGE = "Eex_EuropeanGasSpotIndex"
 PRICE_KEYS = "ZTP,Day"
 PRICE_COLUMN = "Index"
-ROUTE_MAP = {
-    ("Entry","ZPT"):{"endur":["ZBEE Entry"],"type":"seasonal"},
-    ("Entry","Zeebrugge"):{"endur":["ZBHUBEE-N-X"],"type":"seasonal"},
-    ("Entry","VIP THE-ZTP"):{"endur":["VIP THE-ZTP BE"],"type":"seasonal"},
-    ("Exit","VIP BENE"):{"endur":["VIP_BENE_FLX-N-X"],"type":"longterm"},
-    ("Exit","VIP THE-ZTP"):{"endur":["VIP THE-ZTP BE"],"type":"longterm"},
-    ("Exit","Virtualys"):{"endur":["VIRTUALYS (BL)-N-X"],"type":"longterm"},
+# Invoice location -> Endur ng_location_id. Picks up every Endur name variant of a site
+# (e.g. VIP_BENE_FLX and VIP_BENE_FLX-N-X both = BE.FLX.VIPBENE). Direction is NEVER taken from the
+# location: it comes from the deal's instrument_type_name (COMM-CAP-ENTRY / COMM-CAP-EXIT).
+LOCATION_MAP = {
+    "ZPT":"BE.FLX.ZBEEEntry",
+    "Zeebrugge":"BE.FLX.ZBHUBEEEntry-Exit",
+    "VIP THE-ZTP":"BE.VIP.THE.ZTP",
+    "VIP BENE":"BE.FLX.VIPBENE",
+    "Virtualys":"BE.FLX.BL",
 }
+# Timing rule for the Endur-only check (unchanged from the old route list, where every Entry route was
+# 'seasonal' and every Exit route 'longterm'): Exit is only checked for the invoice month; Entry for every
+# billing month on the bill.
+def _endur_only_checked(direction, bm, inv_month): return direction=="Entry" or bm==inv_month
 _LTC_VALID = (
     "Entry at Interconnection Point (Firm)","Exit at Interconnection Point (Firm)",
     "Entry at Interconnection Point (Interruptible)","Exit at Interconnection Point (Interruptible)")
@@ -231,6 +237,12 @@ def _parse_bm(s):
     except: return None
 
 # === LTC CHECK ===
+def _dn(df):
+    """Endur deal numbers of a group of deal rows, as one comma-separated cell (None if no deals)."""
+    if df is None or len(df)==0 or "deal_number" not in df: return None
+    v=sorted({int(x) for x in df["deal_number"].dropna()})
+    return ", ".join(str(x) for x in v) if v else None
+
 def check_ltc(df_all, inv_month, log):
     df_ltc = df_all[df_all["product_name"].apply(lambda p: p.startswith(_LTC_VALID) or "Auction" in p or "Premium" in p)].copy()
     df_lt = df_ltc[df_ltc["invoice_line_group"].isin(IC_GROUPS)].copy()
@@ -266,7 +278,7 @@ def check_ltc(df_all, inv_month, log):
         AND pv2.settlement_type_id=1 AND pv2.price>0 AND LOWER(d2.reference) NOT LIKE '%conversion%'),
     raw AS (SELECT d.deal_number,d.reference,d.service_type AS ect,
         CASE WHEN d.instrument_type_name='COMM-CAP-ENTRY' THEN 'Entry' ELSE 'Exit' END AS direction,
-        l.location_name,CAST(DATE_TRUNC('month',pv.start_date) AS DATE) AS billing_month,
+        l.location_name,l.ng_location_id,CAST(DATE_TRUNC('month',pv.start_date) AS DATE) AS billing_month,
         pv.calculated_profile_volume_kwh AS vol,pv.price,
         pv.calculated_profile_volume_kwh/((DATEDIFF(pv.end_date,pv.start_date)+1)*24) AS cap_kwh_h,
         pv.calculated_profile_volume_kwh*pv.price AS endur_eur,pv.start_date AS pv_start,
@@ -304,14 +316,15 @@ def check_ltc(df_all, inv_month, log):
     for _,r in cb.iterrows():
         bm,d,loc=r["billing_month"],r["direction"],r["location"]
         rt,ct=r["service_rate_type"],r["capacity_type"]
-        cfg=ROUTE_MAP.get((d,loc)); el=cfg["endur"] if cfg else None
+        el=LOCATION_MAP.get(loc); dn=None
         edf = (dlt if rt=="LongTerm" else dse)
         edf = edf[edf["ect"]==ct]
         dim=calendar.monthrange(bm.year,bm.month)[1]
         ec=ee=ep=None
         if el:
             # Endur locations such as 'VIP THE-ZTP BE' hold Entry AND Exit deals -> match on direction too
-            er=edf[(edf["location_name"].isin(el))&(edf["billing_month"]==bm)&(edf["direction"]==d)]
+            er=edf[(edf["ng_location_id"]==el)&(edf["billing_month"]==bm)&(edf["direction"]==d)]
+            dn=_dn(er)
             if rt=="LongTerm" and len(er)>0:
                 cs=abs(er["cap_kwh_h"].sum())  # NET capacity (matches v2 notebook)
                 ca=er["cap_kwh_h"].abs().sum()
@@ -344,7 +357,7 @@ def check_ltc(df_all, inv_month, log):
             gap_eur=round(eq-r["tariff_eur"],2) if eq is not None else None,
             invoice_price=round(ip,9) if ip is not None else None,endur_price=round(ep,9) if ep is not None else None,
             price_gap=round(pgp,9) if pgp is not None else None,
-            price_gap_pct=round(pgpp,3) if pgpp is not None else None,contracts=r["contracts"]))
+            price_gap_pct=round(pgpp,3) if pgpp is not None else None,contracts=r["contracts"],endur_deal_numbers=dn))
         if aeur>0:
             bte=None
             if ip: bte=r["ikwh"]*ip*dim/365 if rt=="LongTerm" else r["tvk"]*ip
@@ -352,10 +365,11 @@ def check_ltc(df_all, inv_month, log):
             comp_rows.append(dict(billing_month=str(bm),direction=d,location=loc,capacity_type=ct,
                 line_type="Auction Premium",service_rate_type=rt,detail="Auction Premium",
                 invoice_kwh_h=None,endur_kwh_h=None,invoice_eur=round(aeur,2),
-                equinor_eur=round(ae,2) if ae is not None else None,gap_eur=round(ae-aeur,2) if ae is not None else None,price_gap_pct=None,contracts=r["contracts"]))
+                equinor_eur=round(ae,2) if ae is not None else None,gap_eur=round(ae-aeur,2) if ae is not None else None,price_gap_pct=None,contracts=r["contracts"],endur_deal_numbers=dn))
     def _lx(r,vol=True):  # EUR + volume picture of the comparison row, stored on every flag
         return dict(ieur=r.get("invoice_eur"),eeur=r.get("equinor_eur"),deur=r.get("gap_eur"),
-                    ivol=r.get("invoice_kwh_h") if vol else None,evol=r.get("endur_kwh_h") if vol else None)
+                    ivol=r.get("invoice_kwh_h") if vol else None,evol=r.get("endur_kwh_h") if vol else None,
+                    dn=r.get("endur_deal_numbers"))
     for _,r in pd.DataFrame(comp_rows).iterrows():
         bms,d,loc,lt=r["billing_month"],r["direction"],r["location"],r["line_type"]
         ct=r.get("capacity_type","Firm")
@@ -383,36 +397,49 @@ def check_ltc(df_all, inv_month, log):
                     flags.append(dict(type="AuctionPremium",gas_day=bms,direction=d,location=loc,
                         invoice_value=r["invoice_eur"],endur_value=r["equinor_eur"],gap=r["gap_eur"],gap_pct=gp,
                         unit="EUR",note=f"auction premium EUR mismatch [{ct}]",**_lx(r,vol=False)))
-    # Endur-only routes (booked in Endur, not invoiced)
+    def _eagg(fr_,et,bm):  # Endur capacity kWh/h + EUR for a group of deal rows (same basis as matched rows)
+        dim_=calendar.monthrange(bm.year,bm.month)[1]; cap=eur_=None
+        if et=="LongTerm":
+            cap=abs(float(fr_["cap_kwh_h"].sum()))
+            ca_=fr_["cap_kwh_h"].abs().sum()
+            ap_=fr_.apply(lambda x:abs(x["price"])*(24*365/1000 if abs(x["price"])>=0.01 else 24*365),axis=1)
+            wp_=(fr_["cap_kwh_h"].abs()*ap_).sum()/ca_ if ca_ else None
+            if wp_ is not None: eur_=cap*wp_*dim_/365
+        else:
+            nd_=fr_["pv_start"].nunique(); cap=float(fr_["cap_kwh_h"].abs().sum())/nd_ if nd_ else None
+            eur_=float(fr_["endur_eur"].abs().sum())
+        return cap,eur_
+    def _endur_flag(bm,d,loc,ect,sel,note):
+        ecap=0.0; eeur=0.0; ft=None; deals=[]
+        for edf_,et in ((dlt,"LongTerm"),(dse,"Season")):
+            fr_=edf_[sel(edf_)&(edf_["ect"]==ect)&(edf_["billing_month"]==bm)&(edf_["direction"]==d)]
+            if len(fr_)==0: continue
+            cap,eur_=_eagg(fr_,et,bm)
+            if cap and cap>0:
+                ecap+=cap; ft=et; deals.append(fr_)
+                if eur_ is not None and not pd.isna(eur_): eeur+=eur_
+        if ecap>0:
+            flags.append(dict(type=ft or "LongTerm",gas_day=str(bm),direction=d,location=loc,
+                invoice_value=None,endur_value=round(ecap,2),gap=None,gap_pct=None,unit="kWh/h",note=note,
+                evol=round(ecap,2),eeur=round(eeur,2) if eeur else None,dn=_dn(pd.concat(deals))))
+    # Endur-only: every mapped location x Entry/Exit x Firm/Interruptible that is booked in Endur but not on the invoice
     for bm in bm_list:
         inv_routes=set((x["direction"],x["location"],x["capacity_type"]) for _,x in cb[cb["billing_month"]==bm].iterrows())
-        for (d,loc),cfg in ROUTE_MAP.items():
-            if bm!=inv_month and cfg["type"]=="longterm": continue
-            for ect in ("Firm","Interruptible"):
-                if (d,loc,ect) in inv_routes: continue
-                ecap=0.0; eeur=0.0; ft=None
-                dim_=calendar.monthrange(bm.year,bm.month)[1]
-                for edf_,et in ((dlt,"LongTerm"),(dse,"Season")):
-                    fr_=edf_[(edf_["ect"]==ect)&(edf_["location_name"].isin(cfg["endur"]))&(edf_["billing_month"]==bm)&(edf_["direction"]==d)]
-                    if len(fr_)==0: continue
-                    eur_=None
-                    if et=="LongTerm":
-                        cap=abs(float(fr_["cap_kwh_h"].sum()))
-                        ca_=fr_["cap_kwh_h"].abs().sum()  # same EUR basis as matched long-term rows
-                        ap_=fr_.apply(lambda x:abs(x["price"])*(24*365/1000 if abs(x["price"])>=0.01 else 24*365),axis=1)
-                        wp_=(fr_["cap_kwh_h"].abs()*ap_).sum()/ca_ if ca_ else None
-                        if wp_ is not None: eur_=cap*wp_*dim_/365
-                    else:
-                        nd_=fr_["pv_start"].nunique(); cap=float(fr_["cap_kwh_h"].abs().sum())/nd_ if nd_ else None
-                        eur_=float(fr_["endur_eur"].abs().sum())
-                    if cap and cap>0:
-                        ecap+=cap; ft=et
-                        if eur_ is not None and not pd.isna(eur_): eeur+=eur_
-                if ecap>0:
-                    flags.append(dict(type=ft or "LongTerm",gas_day=str(bm),direction=d,location=loc,
-                        invoice_value=None,endur_value=round(ecap,2),gap=None,gap_pct=None,
-                        unit="kWh/h",note=f"ENDUR ONLY [{ect}] (not invoiced)",evol=round(ecap,2),
-                        eeur=round(eeur,2) if eeur else None))
+        for loc,ng in LOCATION_MAP.items():
+            for d in ("Entry","Exit"):
+                if not _endur_only_checked(d,bm,inv_month): continue
+                for ect in ("Firm","Interruptible"):
+                    if (d,loc,ect) in inv_routes: continue
+                    _endur_flag(bm,d,loc,ect,lambda x,ng=ng: x["ng_location_id"]==ng,f"ENDUR ONLY [{ect}] (not invoiced)")
+        # Belgian Endur capacity at locations not in LOCATION_MAP -> flagged so nothing is skipped silently
+        known=set(LOCATION_MAP.values())
+        um_=pd.concat([dlt,dse])
+        um_=um_[(~um_["ng_location_id"].isin(known))&(um_["billing_month"]==bm)]
+        for (lname,ng),_g in um_.groupby(["location_name","ng_location_id"]):
+            for d in ("Entry","Exit"):
+                if not _endur_only_checked(d,bm,inv_month): continue
+                for ect in ("Firm","Interruptible"):
+                    _endur_flag(bm,d,lname,ect,lambda x,ng=ng: x["ng_location_id"]==ng,f"UNMAPPED ENDUR LOCATION {lname} ({ng}) [{ect}]")
     log(f"LTC: {len(comp_rows)} comparisons, {len(flags)} flags")
     return comp_rows,flags
 
@@ -589,23 +616,23 @@ def save_results(lc,lf,als,alf,ahf,vfs,vff,eis,eif,df_all,inv_m,ck,inv_file,ack,
     # ack = arrears month (VF + EiC, detected from gas days); sck = allocation settlement month
     ts=datetime.utcnow().isoformat(); inv_m1=(inv_m.replace(day=1)-timedelta(days=1)).replace(day=1)
     ar,af=[],[]
-    def _u(bm,ty,pn,lo,di,ie=None,iv=None,ee=None,ev=None,de=None,dp=None,st_="Not Checked"):
-        return dict(check_month=ck,invoice_file=inv_file,invoice_month=ck,billing_month=str(bm) if bm else None,type=ty,product_name=pn,location=lo or "",direction=di or "",invoice_eur=ie,invoice_volume=iv,equinor_eur=ee,equinor_volume=ev,diff_eur=de,diff_pct=dp,status=st_,run_timestamp=ts)
+    def _u(bm,ty,pn,lo,di,ie=None,iv=None,ee=None,ev=None,de=None,dp=None,st_="Not Checked",dn=None):
+        return dict(check_month=ck,invoice_file=inv_file,invoice_month=ck,billing_month=str(bm) if bm else None,type=ty,product_name=pn,location=lo or "",direction=di or "",invoice_eur=ie,invoice_volume=iv,equinor_eur=ee,equinor_volume=ev,diff_eur=de,diff_pct=dp,status=st_,endur_deal_numbers=dn or None,run_timestamp=ts)
     def _fl(v):
         try:
             v=float(v); return None if pd.isna(v) else v
         except (TypeError,ValueError): return None
-    def _f(bm,ty,gd,lo,di,iv=None,ev=None,d=None,dp=None,u="",fd="",ie_=None,iv_=None,ee_=None,ev_=None,de_=None):
+    def _f(bm,ty,gd,lo,di,iv=None,ev=None,d=None,dp=None,u="",fd="",ie_=None,iv_=None,ee_=None,ev_=None,de_=None,dn_=None):
         # v1.3.0: flags use the same EUR + volume columns as the summaries.
         # Legacy invoice_value/equinor_value/diff/unit are no longer written (left NULL; older rows keep them).
         return dict(check_month=ck,invoice_file=inv_file,billing_month=str(bm),type=ty,gas_day=str(gd),location=lo or "",direction=di or "",
                     invoice_eur=_fl(ie_),invoice_volume=_fl(iv_),equinor_eur=_fl(ee_),equinor_volume=_fl(ev_),diff_eur=_fl(de_),
-                    diff_pct=_fl(dp),flag_detail=fd,run_timestamp=ts)
+                    diff_pct=_fl(dp),flag_detail=fd,endur_deal_numbers=dn_ if isinstance(dn_,str) and dn_ else None,run_timestamp=ts)
     for r in lc:
-        ar.append(_u(r["billing_month"],f"LTC {r['line_type']}",f"{r['capacity_type']} {r.get('service_rate_type','')}",r["location"],r["direction"],ie=r["invoice_eur"],iv=r.get("invoice_kwh_h"),ee=r.get("equinor_eur"),ev=r.get("endur_kwh_h"),de=r.get("gap_eur"),dp=r.get("price_gap_pct"),st_=_gs(r.get("equinor_eur"),r.get("gap_eur"))))
+        ar.append(_u(r["billing_month"],f"LTC {r['line_type']}",f"{r['capacity_type']} {r.get('service_rate_type','')}",r["location"],r["direction"],ie=r["invoice_eur"],iv=r.get("invoice_kwh_h"),ee=r.get("equinor_eur"),ev=r.get("endur_kwh_h"),de=r.get("gap_eur"),dp=r.get("price_gap_pct"),st_=_gs(r.get("equinor_eur"),r.get("gap_eur")),dn=r.get("endur_deal_numbers")))
     for f in lf:
         af.append(_f(f["gas_day"],f.get("type","LTC"),f["gas_day"],f.get("location",""),f.get("direction",""),iv=f.get("invoice_value"),ev=f.get("endur_value"),d=f.get("gap"),dp=f.get("gap_pct"),u=f.get("unit",""),fd=f.get("note",""),
-                     ie_=f.get("ieur"),iv_=f.get("ivol"),ee_=f.get("eeur"),ev_=f.get("evol"),de_=f.get("deur")))
+                     ie_=f.get("ieur"),iv_=f.get("ivol"),ee_=f.get("eeur"),ev_=f.get("evol"),de_=f.get("deur"),dn_=f.get("dn")))
     if vfs:
         ar.append(_u(vfs["check_month"],"Variable Trading Fee","ZTP Trading","ZTP","Entry+Exit",ie=vfs["invoice_eur"],iv=vfs.get("invoice_qty"),ee=vfs["equinor_eur"],ev=vfs.get("equinor_qty"),de=vfs["eur_diff"],dp=vfs["qty_diff_pct"],st_=vfs["verdict"]))
     for f in vff:
@@ -669,11 +696,11 @@ def save_results(lc,lf,als,alf,ahf,vfs,vff,eis,eif,df_all,inv_m,ck,inv_file,ack,
     hs,hf=[],[]
     for per,rows in (("M",mr),("M-1",m1r),("M-3",m3r),("Alloc",asb),("Other",orr)):
         for r in rows:
-            h={k:r.get(k) for k in ("check_month","invoice_file","invoice_month","billing_month","type","product_name","location","direction","invoice_eur","invoice_volume","equinor_eur","equinor_volume","diff_eur","diff_pct","status")}
+            h={k:r.get(k) for k in ("check_month","invoice_file","invoice_month","billing_month","type","product_name","location","direction","invoice_eur","invoice_volume","equinor_eur","equinor_volume","diff_eur","diff_pct","status","endur_deal_numbers")}
             h.update(run_id=rid,run_timestamp=ts,period=per); hs.append(h)
     for per,rows in (("M",mf),("M-1",m1f),("M-3",m3f),("Alloc",afv)):
         for r in rows:
-            h={k:r.get(k) for k in ("check_month","invoice_file","billing_month","type","gas_day","location","direction","invoice_eur","invoice_volume","equinor_eur","equinor_volume","diff_eur","diff_pct","flag_detail")}
+            h={k:r.get(k) for k in ("check_month","invoice_file","billing_month","type","gas_day","location","direction","invoice_eur","invoice_volume","equinor_eur","equinor_volume","diff_eur","diff_pct","flag_detail","endur_deal_numbers")}
             h.update(flag_id=str(uuid.uuid4()),run_id=rid,run_timestamp=ts,run_by=run_by,period=per); hf.append(h)
     if rid:
         def _ins(tbl,rows):
@@ -737,8 +764,9 @@ def pretty_col(c):
 
 def status_first(df):
     """Move status / verdict column(s) to the far left so they are always visible."""
-    sc = [c for c in df.columns if "status" in c.lower() or "verdict" in c.lower()]
-    return df[sc + [c for c in df.columns if c not in sc]]
+    dc = [c for c in df.columns if "deal_number" in c.lower()]  # Endur deal numbers far right
+    sc = [c for c in df.columns if ("status" in c.lower() or "verdict" in c.lower()) and c not in dc]
+    return df[sc + [c for c in df.columns if c not in sc and c not in dc] + dc]
 
 def for_display(df, num_cols=(), status_cols=()):
     """Status first + pretty titles. Returns (df, renamed num_cols, renamed status_cols)."""
@@ -938,7 +966,7 @@ with t3:
             def FSEL(ivn="invoice_volume",evn="equinor_volume",den="diff_eur",dpn="diff_pct"):
                 # flagged rows in the same shape as the summaries; COALESCE fills older rows from the legacy value/unit columns
                 vu="('kWh/h','kWh','MWh')"
-                return (f"flag_detail AS flag,gas_day,type,direction,location,"
+                return (f"endur_deal_numbers,flag_detail AS flag,gas_day,type,direction,location,"
                         f"COALESCE(invoice_eur,CASE WHEN unit='EUR' THEN invoice_value END) AS invoice_eur,"
                         f"COALESCE(equinor_eur,CASE WHEN unit='EUR' THEN equinor_value END) AS equinor_eur,"
                         f"COALESCE(invoice_volume,CASE WHEN unit IN {vu} THEN invoice_value END) AS {ivn},"
@@ -963,22 +991,22 @@ with t3:
                 else: st.success("No flagged issues.")
                 sections.append((title,caption,ds,ft,df))
             show("Capacity M","Capacity bookings where the billing month equals the invoice month.",
-                f"SELECT billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {S('be_m','M')} ORDER BY direction,location",
+                f"SELECT endur_deal_numbers,billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {S('be_m','M')} ORDER BY direction,location",
                 f"SELECT {FSEL('invoice_kwh_h','endur_kwh_h','gap_eur','gap_pct')} FROM {F('be_m_flagged','M')} ORDER BY gas_day",
                 "Capacity M - Flagged Issues")
             st.divider()
             show("Capacity M-1","Capacity bookings where the billing month is one month prior to the invoice month.",
-                f"SELECT billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {S('be_m_minus_1','M-1')} ORDER BY direction,location",
+                f"SELECT endur_deal_numbers,billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {S('be_m_minus_1','M-1')} ORDER BY direction,location",
                 f"SELECT {FSEL('invoice_kwh_h','endur_kwh_h','gap_eur','gap_pct')} FROM {F('be_m_minus_1_flagged','M-1')} ORDER BY gas_day",
                 "Capacity M-1 - Flagged Issues")
             st.divider()
             show("Variable Fees M-3","Variable fees and energy in cash for the invoice month (gas month is M-3).",
-                f"SELECT billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,diff_pct AS qty_diff_pct,status AS verdict FROM {S('be_m_minus_3','M-3')} ORDER BY type",
+                f"SELECT endur_deal_numbers,billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,diff_pct AS qty_diff_pct,status AS verdict FROM {S('be_m_minus_3','M-3')} ORDER BY type",
                 f"SELECT {FSEL(den='eur_diff')} FROM {F('be_m_minus_3_flagged','M-3')} ORDER BY gas_day",
                 "Variable Fees M-3 - Flagged Issues")
             st.divider()
             show("Self Bill","Sales H Grid (allocation settlement)",
-                f"SELECT billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,status AS verdict FROM {S('be_alloc','Alloc')}",
+                f"SELECT endur_deal_numbers,billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,status AS verdict FROM {S('be_alloc','Alloc')}",
                 f"SELECT {FSEL(den='eur_diff')} FROM {F('be_alloc_flagged','Alloc')} ORDER BY gas_day",
                 "Sales H Grid - Flagged Issues")
             st.divider()
@@ -1016,7 +1044,7 @@ with t4:
                      f"COALESCE(invoice_eur,CASE WHEN unit='EUR' THEN invoice_value END) AS invoice_eur,"
                      f"COALESCE(equinor_eur,CASE WHEN unit='EUR' THEN equinor_value END) AS equinor_eur,"
                      f"COALESCE(diff_eur,CASE WHEN unit='EUR' THEN diff END) AS diff_eur,diff_pct,"
-                     f"flag_detail,comment,comment_by,comment_at FROM {SCHEMA}.be_runhistory {where} ORDER BY run_timestamp DESC, period, type, gas_day")
+                     f"flag_detail,comment,comment_by,comment_at,endur_deal_numbers FROM {SCHEMA}.be_runhistory {where} ORDER BY run_timestamp DESC, period, type, gas_day")
         nruns=len(rsel) if rsel else len(rsub)
         m1,m2,m3=st.columns(3)
         m1.metric("Runs",nruns); m2.metric("Flagged issues",len(hist))
@@ -1038,6 +1066,7 @@ with t4:
             ed=st.data_editor(view,key=ekey,use_container_width=True,hide_index=True,
                 disabled=[c for c in view.columns if c not in editable],
                 column_config={
+                    "endur_deal_numbers":st.column_config.TextColumn("Endur Deal Numbers"),
                     "run_timestamp":st.column_config.TextColumn("Run timestamp"),
                     "run_id":st.column_config.TextColumn("Run"),
                     "check_month":st.column_config.TextColumn("Invoice month"),
