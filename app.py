@@ -14,7 +14,7 @@ from databricks.sdk.core import Config
 SCHEMA = "ms_vulcan_gpgtopm_plab.belgium_app_demo_v1"
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.1.0"
+BASE_VERSION = "1.2.0"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -685,6 +685,30 @@ def styled(df, num_cols, status_cols=()):
     if status_cols: sty=sty.map(_sc, subset=list(status_cols))
     return sty
 
+# --- Display column titles: "invoice_kwh_h" -> "Invoice KWH/H", "gap_eur" -> "Gap EUR", "diff_pct" -> "Diff %" ---
+_UNIT_WORDS = {"eur":"EUR","kwh":"KWH","mwh":"MWH","nok":"NOK","pct":"%","id":"ID"}
+
+def pretty_col(c):
+    s = re.sub(r"(kwh|mwh)_h\b", lambda m: m.group(1) + "/h", str(c).lower())
+    out = []
+    for w in s.split("_"):
+        if not w: continue
+        if "/" in w: out.append(w.upper())            # kwh/h -> KWH/H
+        elif w in _UNIT_WORDS: out.append(_UNIT_WORDS[w])
+        else: out.append(w.capitalize())
+    return " ".join(out)
+
+def status_first(df):
+    """Move status / verdict column(s) to the far left so they are always visible."""
+    sc = [c for c in df.columns if "status" in c.lower() or "verdict" in c.lower()]
+    return df[sc + [c for c in df.columns if c not in sc]]
+
+def for_display(df, num_cols=(), status_cols=()):
+    """Status first + pretty titles. Returns (df, renamed num_cols, renamed status_cols)."""
+    df = status_first(df)
+    ren = {c: pretty_col(c) for c in df.columns}
+    return df.rename(columns=ren), [ren[c] for c in num_cols if c in ren], [ren[c] for c in status_cols if c in ren]
+
 def _fmt_month(m):
     try: return pd.to_datetime(m).strftime("%B %Y")
     except Exception: return str(m)
@@ -785,7 +809,9 @@ with t1:
             st.success(f"{f.name} -> {sub}/ ({it}, {hdr['invoice_number']}, EUR {na:,.2f})")
     st.subheader("Invoice Register")
     reg=run_sql(f"SELECT invoice_type,invoice_number,invoice_date,invoice_month,net_amount_eur,file_name,last_check_status FROM {SCHEMA}.invoice_register ORDER BY invoice_type,invoice_date")
-    if len(reg)>0: reg=to_num(reg,["net_amount_eur"]); st.dataframe(reg,use_container_width=True,hide_index=True)
+    if len(reg)>0:
+        reg=to_num(reg,["net_amount_eur"]); reg,_,_=for_display(reg)
+        st.dataframe(reg,use_container_width=True,hide_index=True)
     else: st.info("No invoices uploaded yet.")
 
 with t2:
@@ -879,32 +905,34 @@ with t3:
                 if len(ds)>0:
                     nc=[c for c in ds.columns if any(k in c.lower() for k in ["eur","kwh","volume","diff","pct","gap"])]
                     ds=to_num(ds,nc); sc=[c for c in ds.columns if "status" in c.lower() or "verdict" in c.lower()]
+                    ds,nc,sc=for_display(ds,nc,sc)
                     st.dataframe(styled(ds,nc,sc),use_container_width=True,hide_index=True)
                 else: st.info("No data.")
                 st.markdown(f"### {ft}")
                 df=run_sql(fsql)
                 if len(df)>0:
                     nc=[c for c in df.columns if any(k in c.lower() for k in ["value","diff","pct","gap"])]
-                    df=to_num(df,nc); st.dataframe(styled(df,nc),use_container_width=True,hide_index=True)
+                    df=to_num(df,nc); df,nc,_=for_display(df,nc)
+                    st.dataframe(styled(df,nc),use_container_width=True,hide_index=True)
                 else: st.success("No flagged issues.")
                 sections.append((title,caption,ds,ft,df))
             show("Capacity M","Capacity bookings where the billing month equals the invoice month.",
-                f"SELECT invoice_month,billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {S('be_m','M')} ORDER BY direction,location",
+                f"SELECT billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {S('be_m','M')} ORDER BY direction,location",
                 f"SELECT gas_day,direction,location,type AS booking_type,invoice_value,equinor_value,diff AS gap,diff_pct AS gap_pct,flag_detail AS note FROM {F('be_m_flagged','M')} ORDER BY gas_day",
                 "Capacity M - Flagged Issues")
             st.divider()
             show("Capacity M-1","Capacity bookings where the billing month is one month prior to the invoice month.",
-                f"SELECT invoice_month,billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {S('be_m_minus_1','M-1')} ORDER BY direction,location",
+                f"SELECT billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {S('be_m_minus_1','M-1')} ORDER BY direction,location",
                 f"SELECT gas_day,direction,location,type AS booking_type,invoice_value,equinor_value,diff AS gap,diff_pct AS gap_pct,flag_detail AS note FROM {F('be_m_minus_1_flagged','M-1')} ORDER BY gas_day",
                 "Capacity M-1 - Flagged Issues")
             st.divider()
             show("Variable Fees M-3","Variable fees and energy in cash for the invoice month (gas month is M-3).",
-                f"SELECT invoice_month,billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,diff_pct AS qty_diff_pct,status AS verdict FROM {S('be_m_minus_3','M-3')} ORDER BY type",
+                f"SELECT billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,diff_pct AS qty_diff_pct,status AS verdict FROM {S('be_m_minus_3','M-3')} ORDER BY type",
                 f"SELECT gas_day,type AS line_type,location,direction,invoice_value,equinor_value,diff,diff_pct,unit,flag_detail AS flag FROM {F('be_m_minus_3_flagged','M-3')} ORDER BY gas_day",
                 "Variable Fees M-3 - Flagged Issues")
             st.divider()
             show("Self Bill","Sales H Grid (allocation settlement)",
-                f"SELECT invoice_month,billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,status AS verdict FROM {S('be_alloc','Alloc')}",
+                f"SELECT billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,status AS verdict FROM {S('be_alloc','Alloc')}",
                 f"SELECT gas_day,invoice_value,equinor_value,diff,diff_pct,flag_detail AS flag FROM {F('be_alloc_flagged','Alloc')} ORDER BY gas_day",
                 "Sales H Grid - Flagged Issues")
             st.divider()
