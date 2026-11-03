@@ -14,7 +14,7 @@ from databricks.sdk.core import Config
 SCHEMA = "ms_vulcan_gpgtopm_plab.belgium_app_demo_v1"
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.4.1"
+BASE_VERSION = "1.5.0"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -799,6 +799,61 @@ def render_run_summary(lr):
         with st.expander(f"Show remaining {len(fl)-30} flags"):
             st.markdown("\n".join(f"- **{f['period']}** \u00b7 {describe_flag(f)}" for f in fl[30:]))
 
+# === ENDUR DEAL PANEL (Results tab: click a row -> raw Endur data behind it) ===
+_ENDUR_TYPES = ("LongTerm","Season","AuctionPremium")
+
+def _month_bounds(v):
+    try:
+        d=pd.to_datetime(str(v)[:10]).date().replace(day=1)
+        return d, d.replace(day=calendar.monthrange(d.year,d.month)[1])
+    except Exception: return None, None
+
+def render_endur_panel(row, key):
+    """Raw, unprocessed Endur rows (deal + profilevolume + location) for the selected table row."""
+    dn=row.get("endur_deal_numbers"); typ=str(row.get("line_type") or row.get("type") or "")
+    loc=row.get("location"); dirn=row.get("direction")
+    ms,me=_month_bounds(row.get("billing_month") or row.get("gas_day"))
+    deals=[int(x) for x in re.findall(r"\d+",dn)] if isinstance(dn,str) else []
+    fallback=(not deals) and loc in LOCATION_MAP and (typ.startswith("LTC") or typ in _ENDUR_TYPES)
+    with st.container(border=True):
+        if not deals and not fallback:
+            st.info("This row is not based on Endur capacity deals (e.g. variable fee, energy in cash, allocation or fixed fee), so there is nothing to show from Endur.")
+            return
+        what=f"{dirn or ''} {loc or ''}".strip()
+        mlabel=ms.strftime("%B %Y") if ms else "all months"
+        if deals:
+            st.markdown(f"#### Endur deals for {what} \u00b7 {mlabel}")
+            st.caption(f"Deal numbers: {', '.join(str(x) for x in deals)}")
+            where=f"d.deal_number IN ({','.join(str(x) for x in deals)})"
+        else:
+            st.markdown(f"#### All Endur capacity deals at {loc} ({LOCATION_MAP[loc]}) \u00b7 {mlabel}")
+            st.caption("No Endur deal numbers on this row, so this shows every Entry and Exit capacity deal at this location \u2014 useful to see why nothing matched.")
+            where=f"l.ng_location_id='{LOCATION_MAP[loc]}' AND d.instrument_type_name IN ('COMM-CAP-ENTRY','COMM-CAP-EXIT')"
+        per=f" AND pv.start_date<='{me}' AND pv.end_date>='{ms}'" if ms else ""  # always just the selected billing month
+        q=("SELECT d.deal_number,d.reference,d.instrument_type_name,d.service_type,d.buy_sell_name,d.tran_status,"
+           "d.deal_start_date,d.deal_end_date,d.trade_date,d.para_position,"
+           "l.location_name,l.ng_location_id,pv.settlement_type_id,pv.start_date,pv.end_date,pv.price,"
+           "pv.calculated_profile_volume_kwh,pv.calculated_profile_volume,pv.calculated_payment,"
+           "pv.unit_id,pv.price_unit_id,pv.volume_type_name "
+           "FROM ms_atlas.endur_standard.deal_v2latest d "
+           "JOIN ms_atlas.endur_standard.profilevolume_v2latest pv ON d.deal_number=pv.deal_number "
+           "JOIN ms_atlas.endur_standard.location_v2latest l ON pv.location_id=l.location_id "
+           f"WHERE {where}{per} ORDER BY d.deal_number,pv.start_date,pv.settlement_type_id,pv.price LIMIT 5000")
+        with st.spinner("Querying Endur..."):
+            raw=run_sql(q)
+        if len(raw)==0:
+            st.warning("No Endur rows found for this selection."); return
+        raw=to_num(raw,["para_position","price","calculated_profile_volume_kwh","calculated_profile_volume","calculated_payment"])
+        hc=["deal_number","reference","instrument_type_name","service_type","buy_sell_name","tran_status","deal_start_date","deal_end_date","trade_date","para_position"]
+        st.markdown("**Deal header** (`deal_v2latest`)")
+        st.dataframe(raw[hc].drop_duplicates(),use_container_width=True,hide_index=True)
+        pc=["deal_number","location_name","ng_location_id","settlement_type_id","start_date","end_date","price","calculated_profile_volume_kwh","calculated_profile_volume","calculated_payment","unit_id","price_unit_id","volume_type_name"]
+        st.markdown(f"**Profile rows** (`profilevolume_v2latest`, {len(raw)} rows)")
+        st.dataframe(raw[pc],use_container_width=True,hide_index=True)
+        st.caption("Raw, unprocessed and live from Endur (as it is now, not as it was at the time of the run). "
+                   "All rows are shown, including price = 0 rows and every settlement type; the check itself only uses "
+                   "settlement_type_id = 1 with price \u2260 0 (plus zero-price PRI_SEC sells where applicable).")
+
 # === EXCEL EXPORT ===
 def build_results_excel(sections, month_label):
     """One sheet per section (Capacity M, M-1, Variable Fees M-3, Self Bill).
@@ -979,15 +1034,20 @@ with t3:
                 if len(ds)>0:
                     nc=[c for c in ds.columns if any(k in c.lower() for k in ["eur","kwh","volume","diff","pct","gap"])]
                     ds=to_num(ds,nc); sc=[c for c in ds.columns if "status" in c.lower() or "verdict" in c.lower()]
-                    ds,nc,sc=for_display(ds,nc,sc)
-                    st.dataframe(styled(ds,nc,sc),use_container_width=True,hide_index=True)
+                    raw_s=ds.copy(); ds,nc,sc=for_display(ds,nc,sc)
+                    ev=st.dataframe(styled(ds,nc,sc),use_container_width=True,hide_index=True,
+                                    on_select="rerun",selection_mode="single-row",key=f"sel_{title}_s")
+                    st.caption("Select a row to see the raw Endur deals behind it.")
+                    if ev and ev.selection.rows: render_endur_panel(raw_s.iloc[ev.selection.rows[0]].to_dict(),f"ep_{title}_s")
                 else: st.info("No data.")
                 st.markdown(f"### {ft}")
                 df=run_sql(fsql)
                 if len(df)>0:
                     nc=[c for c in df.columns if any(k in c.lower() for k in ["eur","kwh","volume","diff","pct","gap"])]
-                    df=to_num(df,nc); df,nc,_=for_display(df,nc)
-                    st.dataframe(styled(df,nc),use_container_width=True,hide_index=True)
+                    df=to_num(df,nc); raw_f=df.copy(); df,nc,_=for_display(df,nc)
+                    ev=st.dataframe(styled(df,nc),use_container_width=True,hide_index=True,
+                                    on_select="rerun",selection_mode="single-row",key=f"sel_{title}_f")
+                    if ev and ev.selection.rows: render_endur_panel(raw_f.iloc[ev.selection.rows[0]].to_dict(),f"ep_{title}_f")
                 else: st.success("No flagged issues.")
                 sections.append((title,caption,ds,ft,df))
             show("Capacity M","Capacity bookings where the billing month equals the invoice month.",
