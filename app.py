@@ -12,6 +12,12 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.core import Config
 
 SCHEMA = "ms_vulcan_gpgtopm_plab.belgium_app_demo_v1"
+
+# --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
+BASE_VERSION = "1.1.0"
+APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
+IS_DEV = APP_NAME.endswith("-dev")
+APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
 VOLUME = "/Volumes/ms_vulcan_gpgtopm_plab/belgium_app_demo_v1/invoices"
 DISPATCH_TABLE = "ms_atlas.dispatchnatgas_standard.hourly_v2latest"
 PRICE_TABLE = "ms_atlas.ms07splitprice_standard.eex_v1r0"
@@ -751,7 +757,8 @@ def build_results_excel(sections, month_label):
     return buf.getvalue()
 
 # === STREAMLIT UI ===
-st.title("Belgium Invoice Checker")
+st.title("Belgium Invoice Checker" + (" (DEV)" if IS_DEV else ""))
+st.caption(f"Version {APP_VERSION}")
 t1,t2,t3,t4 = st.tabs(["Upload Invoices","Run Check","Results","Run History"])
 
 def _user_email():
