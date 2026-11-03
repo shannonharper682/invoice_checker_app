@@ -14,7 +14,7 @@ from databricks.sdk.core import Config
 SCHEMA = "ms_vulcan_gpgtopm_plab.belgium_app_demo_v1"
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.3.0"
+BASE_VERSION = "1.3.1"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -310,7 +310,8 @@ def check_ltc(df_all, inv_month, log):
         dim=calendar.monthrange(bm.year,bm.month)[1]
         ec=ee=ep=None
         if el:
-            er=edf[(edf["location_name"].isin(el))&(edf["billing_month"]==bm)]
+            # Endur locations such as 'VIP THE-ZTP BE' hold Entry AND Exit deals -> match on direction too
+            er=edf[(edf["location_name"].isin(el))&(edf["billing_month"]==bm)&(edf["direction"]==d)]
             if rt=="LongTerm" and len(er)>0:
                 cs=abs(er["cap_kwh_h"].sum())  # NET capacity (matches v2 notebook)
                 ca=er["cap_kwh_h"].abs().sum()
@@ -389,18 +390,29 @@ def check_ltc(df_all, inv_month, log):
             if bm!=inv_month and cfg["type"]=="longterm": continue
             for ect in ("Firm","Interruptible"):
                 if (d,loc,ect) in inv_routes: continue
-                ecap=0.0; ft=None
+                ecap=0.0; eeur=0.0; ft=None
+                dim_=calendar.monthrange(bm.year,bm.month)[1]
                 for edf_,et in ((dlt,"LongTerm"),(dse,"Season")):
-                    fr_=edf_[(edf_["ect"]==ect)&(edf_["location_name"].isin(cfg["endur"]))&(edf_["billing_month"]==bm)]
+                    fr_=edf_[(edf_["ect"]==ect)&(edf_["location_name"].isin(cfg["endur"]))&(edf_["billing_month"]==bm)&(edf_["direction"]==d)]
                     if len(fr_)==0: continue
-                    if et=="LongTerm": cap=abs(float(fr_["cap_kwh_h"].sum()))
+                    eur_=None
+                    if et=="LongTerm":
+                        cap=abs(float(fr_["cap_kwh_h"].sum()))
+                        ca_=fr_["cap_kwh_h"].abs().sum()  # same EUR basis as matched long-term rows
+                        ap_=fr_.apply(lambda x:abs(x["price"])*(24*365/1000 if abs(x["price"])>=0.01 else 24*365),axis=1)
+                        wp_=(fr_["cap_kwh_h"].abs()*ap_).sum()/ca_ if ca_ else None
+                        if wp_ is not None: eur_=cap*wp_*dim_/365
                     else:
                         nd_=fr_["pv_start"].nunique(); cap=float(fr_["cap_kwh_h"].abs().sum())/nd_ if nd_ else None
-                    if cap and cap>0: ecap+=cap; ft=et
+                        eur_=float(fr_["endur_eur"].abs().sum())
+                    if cap and cap>0:
+                        ecap+=cap; ft=et
+                        if eur_ is not None and not pd.isna(eur_): eeur+=eur_
                 if ecap>0:
                     flags.append(dict(type=ft or "LongTerm",gas_day=str(bm),direction=d,location=loc,
                         invoice_value=None,endur_value=round(ecap,2),gap=None,gap_pct=None,
-                        unit="kWh/h",note=f"ENDUR ONLY [{ect}] (not invoiced)",evol=round(ecap,2)))
+                        unit="kWh/h",note=f"ENDUR ONLY [{ect}] (not invoiced)",evol=round(ecap,2),
+                        eeur=round(eeur,2) if eeur else None))
     log(f"LTC: {len(comp_rows)} comparisons, {len(flags)} flags")
     return comp_rows,flags
 
@@ -626,9 +638,12 @@ def save_results(lc,lf,als,alf,ahf,vfs,vff,eis,eif,df_all,inv_m,ck,inv_file,ack,
     if len(um)>0:
         for _,u in um.groupby(["product_name","location","direction"],dropna=False,as_index=False).agg(ie_=("billed_amount","sum"),iv_=("qty","sum"),bs_=("billing_start","first")).iterrows():
             bm=u["bs_"].replace(day=1) if u["bs_"] else inv_m
-            ar.append(_u(str(bm),"Fixed Fee",u["product_name"],u["location"],u["direction"],ie=round(u["ie_"],2),iv=round(u["iv_"],2) if pd.notna(u["iv_"]) else None,st_="No Equinor Match"))
+            # qty on a flat fee (ZTP Trading Fixed Fee, Zee Platform) is a count of 1, not a volume -> no volume.
+            # Real volumes on other unmatched lines (e.g. capacity exceeding, qty 8,947) are kept.
+            fv=None if (pd.isna(u["iv_"]) or abs(float(u["iv_"])-1)<1e-9) else round(float(u["iv_"]),2)
+            ar.append(_u(str(bm),"Fixed Fee",u["product_name"],u["location"],u["direction"],ie=round(u["ie_"],2),iv=fv,st_="No Equinor Match"))
             af.append(_f(str(bm),"Fixed Fee",str(bm),u["location"],u["direction"] or "",iv=round(u["ie_"],2),u="EUR",fd=f"No Equinor match \u2014 {u['product_name']}",
-                       ie_=round(u["ie_"],2),iv_=round(u["iv_"],2) if pd.notna(u["iv_"]) else None))
+                       ie_=round(u["ie_"],2),iv_=fv))
     def _route(rows):
         m,m1,m3,o=[],[],[],[]
         for r in rows:
