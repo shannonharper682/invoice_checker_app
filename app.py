@@ -14,7 +14,7 @@ from databricks.sdk.core import Config
 SCHEMA = "ms_vulcan_gpgtopm_plab.belgium_app_demo_v1"
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.5.0"
+BASE_VERSION = "1.6.0"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -538,7 +538,9 @@ def check_vf(df_all,ms,me,ck,log):
     iet=vc["xqm"].sum(); eet=vc["exm"].sum(); evdp=(eet-iet)/iet*100 if iet else 0
     igt=vc["tae"].sum(); egt=vc["exc"].sum()*2; gtd=egt-igt
     v="VERIFIED" if abs(evdp)<1 else "REVIEW REQUIRED"
-    s=dict(check_month=ck,line_type="Variable Trading Fee",invoice_qty=float(iet),equinor_qty=float(eet),invoice_eur=igt,equinor_eur=egt,eur_diff=gtd,qty_diff_pct=evdp,days_flagged=len(vfl),verdict=v)
+    s=dict(check_month=ck,line_type="Variable Trading Fee",invoice_qty=float(iet),equinor_qty=float(eet),invoice_eur=igt,equinor_eur=egt,eur_diff=gtd,qty_diff_pct=evdp,days_flagged=len(vfl),verdict=v,
+           # Entry + Exit MWh (what the EUR is charged on) - used by the Overview; Equinor side = exit x 2, same as equinor_eur
+           invoice_qty_all=float(vd["eqm"].fillna(0).sum()+vd["xqm"].fillna(0).sum()),equinor_qty_all=float(eet*2))
     fr=[dict(gas_day=str(r["gas_day"]),line_type="Variable Trading Fee",inv_qty=float(r["xqm"]),eq_qty=float(r["exm"]),qty_diff=float(r["xdm"]),qty_diff_pct=float(r["xdp"]),inv_up=float(up),eq_price=float(up),ieur=float(r["xae"]),eeur=float(r["exc"]),deur=float(r["cd"]),flag=r["flag"]) for _,r in vfl.iterrows()]
     log(f"VF: invoice={igt:,.2f}, verdict={v}, {len(fr)} flags")
     return s,fr
@@ -711,6 +713,30 @@ def save_results(lc,lf,als,alf,ahf,vfs,vff,eis,eif,df_all,inv_m,ck,inv_file,ack,
                 exec_sql(f"INSERT INTO {SCHEMA}.{tbl} ({','.join(cs)}) VALUES {','.join(vs[i:i+200])}")
         log(f"Saving run history: {len(hs)} summary rows, {len(hf)} flags")
         _ins("be_runhistory_summary",hs); _ins("be_runhistory",hf)
+    # --- Overview (variable costs): one row per bill item for this invoice month, replaced on every run ---
+    ov=[]
+    def _ov(bm,item,unit,iv,ie,ev,ee,stt):
+        iv,ie,ev,ee=_fl(iv),_fl(ie),_fl(ev),_fl(ee)
+        if iv is None and ie is None and ev is None and ee is None: return
+        de=(ee-ie) if (ee is not None and ie is not None) else None
+        ov.append(dict(check_month=ck,invoice_file=inv_file,billing_month=str(bm) if bm else None,item_group="Variable cost",item=item,volume_unit=unit,
+            invoice_volume=iv,invoice_eur=ie,invoice_price=(ie/iv if (ie is not None and iv) else None),
+            equinor_volume=ev,equinor_eur=ee,equinor_price=(ee/ev if (ee is not None and ev) else None),
+            diff_eur=de,diff_pct=(de/abs(ie)*100 if (de is not None and ie) else None),status=stt,run_id=rid,run_timestamp=ts))
+    for a in als:
+        if a["line"]=="Purchases":
+            _ov(sck,"Alloc Settlement Buy","kWh",a.get("invoice_kwh"),a.get("invoice_eur"),a.get("equinor_kwh"),a.get("equinor_eur"),a.get("status"))
+    _EIC={"Entry at Interconnection Point":"Energy in Cash - Entry IP","Exit at Domestic Point":"Energy in Cash - Exit Dom","Exit at Interconnection Point":"Energy in Cash - Exit IP"}
+    for e in eis:
+        _ov(ack,_EIC.get(e.get("category"),"Energy in Cash - "+str(e.get("category"))),"kWh",e.get("invoice_qty"),e.get("invoice_eur"),e.get("equinor_qty"),e.get("equinor_eur"),e.get("verdict"))
+    if vfs:
+        _ov(ack,"ZTP Trading","MWh",vfs.get("invoice_qty_all"),vfs.get("invoice_eur"),vfs.get("equinor_qty_all"),vfs.get("equinor_eur"),vfs.get("verdict"))
+    if ov:
+        tie=sum(r["invoice_eur"] or 0 for r in ov)
+        tee=sum(r["equinor_eur"] or 0 for r in ov) if any(r["equinor_eur"] is not None for r in ov) else None
+        _ov(ack,"Total variable cost","EUR",None,tie,None,tee,None)
+    log(f"Saving overview: {len(ov)} rows")
+    _sv("be_overview",ov)
     log("All results saved.")
     counts=dict(be_m=len(mr),be_m_minus_1=len(m1r),be_m_minus_3=len(m3r),be_alloc=len(asb),flags=len(mf)+len(m1f)+len(m3f)+len(afv))
     return counts,hf,ts
@@ -903,7 +929,7 @@ def build_results_excel(sections, month_label):
 # === STREAMLIT UI ===
 st.title("Belgium Invoice Checker" + (" (DEV)" if IS_DEV else ""))
 st.caption(f"Version {APP_VERSION}")
-t1,t2,t3,t4 = st.tabs(["Upload Invoices","Run Check","Results","Run History"])
+t1,t2,t3,t5,t4 = st.tabs(["Upload Invoices","Run Check","Results","Overview","Run History"])
 
 def _user_email():
     h=st.context.headers
@@ -1158,3 +1184,59 @@ with t4:
                     st.rerun()
             if st.session_state.get("rh_saved_msg"):
                 st.success(st.session_state.pop("rh_saved_msg"))
+
+with t5:
+    st.header("Overview")
+    st.caption("Variable-cost items on each Fluxys bill, invoice vs Equinor, month by month. Each month shows its latest Run Check; a month appears once it has been run.")
+    ovd=run_sql(f"SELECT * FROM {SCHEMA}.be_overview ORDER BY check_month")
+    if len(ovd)==0:
+        st.info("No overview yet. Run a check for a month to start building it.")
+    else:
+        OVN=["invoice_volume","invoice_eur","invoice_price","equinor_volume","equinor_eur","equinor_price","diff_eur","diff_pct"]
+        ovd=to_num(ovd,OVN)
+        ITEMS=["Alloc Settlement Buy","Energy in Cash - Entry IP","Energy in Cash - Exit Dom","Energy in Cash - Exit IP","ZTP Trading","Total variable cost"]
+        present=set(ovd["item"])
+        items=[i for i in ITEMS if i in present]+sorted(present-set(ITEMS))
+        MET={"Invoice volume":"invoice_volume","Invoice \u20ac":"invoice_eur","Invoice \u20ac/unit":"invoice_price",
+             "Equinor volume":"equinor_volume","Equinor \u20ac":"equinor_eur","Equinor \u20ac/unit":"equinor_price",
+             "Diff \u20ac":"diff_eur","Diff %":"diff_pct"}
+        sel_items=st.multiselect("Variable cost items",items,default=items,placeholder="All items")
+        sel_items=sel_items or items  # nothing picked = show all
+        c1,c2=st.columns([3,1])
+        mets=c1.multiselect("Show",list(MET),default=["Invoice volume","Invoice \u20ac","Equinor volume","Equinor \u20ac","Diff \u20ac"])
+        thr=c2.number_input("Highlight month-on-month change above (%)",min_value=0.0,value=20.0,step=5.0)
+        months=sorted(ovd["check_month"].unique())
+        wide=pd.DataFrame(index=[_fmt_month(m) for m in months])
+        mom_cols,price_cols,pct_cols=[],[],[]
+        for it in sel_items:
+            sub=ovd[ovd["item"]==it].drop_duplicates("check_month").set_index("check_month")
+            unit=str(sub["volume_unit"].dropna().iloc[0]) if sub["volume_unit"].notna().any() else ""
+            for m in mets:
+                col=MET[m]
+                if it=="Total variable cost" and ("volume" in col or "price" in col): continue
+                lab=f"{it} \u00b7 {m}"+(f" ({unit})" if "volume" in col else (f" (\u20ac/{unit})" if "price" in col else ""))
+                wide[lab]=sub[col].reindex(months).values
+                if col in ("invoice_volume","invoice_eur","invoice_price","equinor_volume","equinor_eur","equinor_price"): mom_cols.append(lab)
+                if "price" in col: price_cols.append(lab)
+                if col=="diff_pct": pct_cols.append(lab)
+        # month-on-month change vs the previous month shown in the table
+        hi=pd.DataFrame("",index=wide.index,columns=wide.columns)
+        for c in mom_cols:
+            prev=wide[c].shift(1); chg=(wide[c]-prev)/prev.abs()
+            hi.loc[(chg.abs()>thr/100).fillna(False).values,c]="background-color:#ffe0b2"
+        numc=list(wide.columns)
+        fmt={c:("{:,.6f}" if c in price_cols else "{:,.2f}") for c in numc}
+        st.dataframe(wide.style.format(fmt,na_rep="").apply(lambda _:hi,axis=None),use_container_width=True)
+        st.caption(f"Orange = changed by more than {thr:.0f}% versus the previous month in the table. Volume units: kWh (Alloc, Energy in Cash), MWh (ZTP Trading, Entry + Exit).")
+        st.subheader("Item trend")
+        it=st.selectbox("Item",items,index=items.index("Total variable cost") if "Total variable cost" in items else 0)
+        sub=ovd[ovd["item"]==it].drop_duplicates("check_month").sort_values("check_month").copy()
+        ch=sub.set_index(pd.to_datetime(sub["check_month"]))[["invoice_eur","equinor_eur"]].rename(columns={"invoice_eur":"Invoice \u20ac","equinor_eur":"Equinor \u20ac"})
+        st.line_chart(ch)
+        sub["invoice_eur_change_pct"]=(sub["invoice_eur"]-sub["invoice_eur"].shift(1))/sub["invoice_eur"].shift(1).abs()*100
+        tv=sub[["status","check_month","invoice_volume","invoice_eur","invoice_eur_change_pct","equinor_volume","equinor_eur","diff_eur","diff_pct"]].copy()
+        tv["check_month"]=tv["check_month"].apply(_fmt_month)
+        tv=tv.rename(columns={"check_month":"invoice_month"})
+        tn=["invoice_volume","invoice_eur","invoice_eur_change_pct","equinor_volume","equinor_eur","diff_eur","diff_pct"]
+        tv,tn2,ts2=for_display(tv,tn,["status"])
+        st.dataframe(styled(tv,tn2,ts2),use_container_width=True,hide_index=True)
