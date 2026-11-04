@@ -14,7 +14,7 @@ from databricks.sdk.core import Config
 SCHEMA = "ms_vulcan_gpgtopm_plab.belgium_app_demo_v1"
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.6.0"
+BASE_VERSION = "1.7.0"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -488,6 +488,15 @@ def check_alloc(bill_xml,sb_xml,ss,se,log):
     pd_=epe-ipe if hf else 0; sd_=ese-ise if hf else 0
     summary=[dict(line="Purchases",invoice_eur=float(ipe),invoice_kwh=float(ipk),equinor_eur=float(epe) if hf else None,equinor_kwh=float(epk2) if hf else None,diff_eur=float(pd_) if hf else None,diff_pct=round(pd_/ipe*100,2) if (hf and ipe) else None,status="Awaiting Final" if not hf else _gs(epe,pd_,"Dispatch")),
         dict(line="Sales (self-bill)",invoice_eur=float(ise),invoice_kwh=float(isk),equinor_eur=float(ese) if hf else None,equinor_kwh=float(esk2) if hf else None,diff_eur=float(sd_) if hf else None,diff_pct=round(sd_/ise*100,2) if (hf and ise) else None,status="Awaiting Final" if not hf else _gs(ese,sd_,"Dispatch"))]
+    # gas-day breakdown for the Results tab (every day, not just flagged ones)
+    def _bflag(f): return "" if ("self-bill" in f.lower() or "sale" in f.lower()) else f
+    def _sflag(f): return "" if ("(bill)" in f or "purchase" in f.lower() or f.startswith("Bill entry")) else f
+    summary[0]["daily"]=[dict(gas_day=str(r["gas_day"]),invoice_volume=float(r["bqk"]),invoice_eur=float(r["beur"]),
+        equinor_volume=float(r["epk"]) if hf else None,equinor_eur=float(r["epe"]) if hf else None,flag=_bflag(r["flag"]))
+        for _,r in ac.iterrows() if (r["bqk"] or r["epk"] or _bflag(r["flag"]))]
+    summary[1]["daily"]=[dict(gas_day=str(r["gas_day"]),invoice_volume=float(r["sqk"]),invoice_eur=float(r["seur"]),
+        equinor_volume=float(r["esk"]) if hf else None,equinor_eur=float(r["ese"]) if hf else None,flag=_sflag(r["flag"]))
+        for _,r in ac.iterrows() if (r["sqk"] or r["esk"] or _sflag(r["flag"]))]
     # net per gas day = sales - purchases (same basis as the EUR / qty mismatch tests above)
     def _apct(d,b): return round(d/abs(b)*100,2) if b else None
     fr=[dict(gas_day=str(f["gas_day"]),invoice_value=float(f.get("beur")),equinor_value=float(f.get("epe")),diff=float(f.get("ed")),
@@ -541,6 +550,9 @@ def check_vf(df_all,ms,me,ck,log):
     s=dict(check_month=ck,line_type="Variable Trading Fee",invoice_qty=float(iet),equinor_qty=float(eet),invoice_eur=igt,equinor_eur=egt,eur_diff=gtd,qty_diff_pct=evdp,days_flagged=len(vfl),verdict=v,
            # Entry + Exit MWh (what the EUR is charged on) - used by the Overview; Equinor side = exit x 2, same as equinor_eur
            invoice_qty_all=float(vd["eqm"].fillna(0).sum()+vd["xqm"].fillna(0).sum()),equinor_qty_all=float(eet*2))
+    # gas-day breakdown (Entry + Exit, same basis as the monthly figures); flag is the exit-quantity test above
+    s["daily"]=[dict(gas_day=str(r["gas_day"]),invoice_volume=float(r["eqm"]+r["xqm"]),invoice_eur=float(r["tae"]),
+                     equinor_volume=float(r["exm"]*2),equinor_eur=float(r["exc"]*2),flag=r["flag"]) for _,r in vc.iterrows()]
     fr=[dict(gas_day=str(r["gas_day"]),line_type="Variable Trading Fee",inv_qty=float(r["xqm"]),eq_qty=float(r["exm"]),qty_diff=float(r["xdm"]),qty_diff_pct=float(r["xdp"]),inv_up=float(up),eq_price=float(up),ieur=float(r["xae"]),eeur=float(r["exc"]),deur=float(r["cd"]),flag=r["flag"]) for _,r in vfl.iterrows()]
     log(f"VF: invoice={igt:,.2f}, verdict={v}, {len(fr)} flags")
     return s,fr
@@ -581,6 +593,8 @@ def check_eic(df_all,ms,me,ck,log):
         it=iv["ia"].sum(); et=cp["ea"].sum(); ed=et-it
         v="VERIFIED" if (it and abs(ed/it*100)<0.1 and cp["pm"].all()) else "REVIEW REQUIRED"
         sr.append(dict(category=cat,line_type="Energy in Cash",invoice_qty=float(iqs),equinor_qty=float(eqs),invoice_eur=it,equinor_eur=et,eur_diff=ed,qty_diff_pct=(eqs-iqs)/iqs*100 if iqs else None,days_flagged=len(cp[cp["flag"]!=""]),price_match=bool(cp["pm"].all()),verdict=v))
+        sr[-1]["daily"]=[dict(gas_day=str(r["gas_day"]),invoice_volume=r["iq"],invoice_eur=r["ia"],invoice_price=r["iup"],
+                              equinor_volume=r["eqty"],equinor_eur=r["ea"],equinor_price=r["ep"],flag=r["flag"]) for _,r in cp.iterrows()]
         for _,r in cp[cp["flag"]!=""].iterrows():
             fr.append(dict(gas_day=str(r["gas_day"]),category=cat,line_type="Energy in Cash",inv_qty=float(r["iq"]),eq_qty=float(r["eqty"]),qty_diff=float(r["qd"]),qty_diff_pct=float(r["qdp"]),inv_up=float(r["iup"]),eq_price=float(r["ep"]),ieur=float(r["ia"]),eeur=float(r["ea"]),deur=float(r["ad"]),flag=r["flag"].strip()))
     log(f"EiC: {len(sr)} categories, {len(fr)} flags")
@@ -713,6 +727,27 @@ def save_results(lc,lf,als,alf,ahf,vfs,vff,eis,eif,df_all,inv_m,ck,inv_file,ack,
                 exec_sql(f"INSERT INTO {SCHEMA}.{tbl} ({','.join(cs)}) VALUES {','.join(vs[i:i+200])}")
         log(f"Saving run history: {len(hs)} summary rows, {len(hf)} flags")
         _ins("be_runhistory_summary",hs); _ins("be_runhistory",hf)
+    # --- Gas-day detail (be_daily): every day of the daily items, replaced on every run ---
+    dly=[]
+    def _dl(sec,bm,item,unit,rows):
+        for r in rows or []:
+            iv,ie,ev,ee=_fl(r.get("invoice_volume")),_fl(r.get("invoice_eur")),_fl(r.get("equinor_volume")),_fl(r.get("equinor_eur"))
+            ip=_fl(r.get("invoice_price")) if "invoice_price" in r else (ie/iv if (ie is not None and iv) else None)
+            ep=_fl(r.get("equinor_price")) if "equinor_price" in r else (ee/ev if (ee is not None and ev) else None)
+            dv=(ev-iv) if (ev is not None and iv is not None) else None
+            de=(ee-ie) if (ee is not None and ie is not None) else None
+            dly.append(dict(check_month=ck,invoice_file=inv_file,billing_month=str(bm) if bm else None,section=sec,item=item,unit=unit,gas_day=r.get("gas_day"),
+                invoice_volume=iv,invoice_eur=ie,invoice_price=ip,equinor_volume=ev,equinor_eur=ee,equinor_price=ep,
+                diff_volume=dv,diff_eur=de,diff_pct=(dv/abs(iv)*100 if (dv is not None and iv) else None),
+                flag=(str(r.get("flag") or "").replace("\u26a0\ufe0f","").strip() or None),run_id=rid,run_timestamp=ts))
+    _EIC={"Entry at Interconnection Point":"Energy in Cash - Entry IP","Exit at Domestic Point":"Energy in Cash - Exit Dom","Exit at Interconnection Point":"Energy in Cash - Exit IP"}
+    for e in eis: _dl("M-3",ack,_EIC.get(e.get("category"),"Energy in Cash - "+str(e.get("category"))),"kWh",e.get("daily"))
+    if vfs: _dl("M-3",ack,"ZTP Trading","MWh",vfs.get("daily"))
+    for a in als:
+        if a["line"]=="Purchases": _dl("M-3",sck,"Alloc Settlement Buy","kWh",a.get("daily"))
+        elif "Sales" in a.get("line",""): _dl("Alloc",sck,"Alloc Settlement Sale","kWh",a.get("daily"))
+    log(f"Saving gas-day detail: {len(dly)} rows")
+    _sv("be_daily",dly)
     # --- Overview (variable costs): one row per bill item for this invoice month, replaced on every run ---
     ov=[]
     def _ov(bm,item,unit,iv,ie,ev,ee,stt):
@@ -880,49 +915,104 @@ def render_endur_panel(row, key):
                    "All rows are shown, including price = 0 rows and every settlement type; the check itself only uses "
                    "settlement_type_id = 1 with price \u2260 0 (plus zero-price PRI_SEC sells where applicable).")
 
+# === GAS-DAY PANEL (Results tab: select a daily item -> every gas day, invoice vs Equinor) ===
+_EIC_ITEMS={"Entry at Interconnection Point":"Energy in Cash - Entry IP","Exit at Domestic Point":"Energy in Cash - Exit Dom","Exit at Interconnection Point":"Energy in Cash - Exit IP"}
+_DAILY_NUM=["invoice_volume","invoice_eur","invoice_price","equinor_volume","equinor_eur","equinor_price","diff_volume","diff_eur","diff_pct"]
+
+def _daily_item(row):
+    """be_daily item for a summary row, or None if the row has no gas-day granularity (capacity, fixed fees)."""
+    t=str(row.get("line_type") or row.get("type") or ""); it=str(row.get("item") or "")
+    if t=="Energy in Cash": return _EIC_ITEMS.get(it,"Energy in Cash - "+it)
+    if t=="Variable Trading Fee": return "ZTP Trading"
+    if t=="Allocation Settlement": return "Alloc Settlement Sale" if "Sale" in it else "Alloc Settlement Buy"
+    return None
+
+def render_daily_panel(row, mf, key):
+    item=_daily_item(row); bm=row.get("billing_month")
+    with st.container(border=True):
+        st.markdown(f"#### Gas-day breakdown \u00b7 {item} \u00b7 {_fmt_month(bm) if bm else ''}")
+        q=(f"SELECT * FROM {SCHEMA}.be_daily WHERE check_month IN ({mf}) AND item={sql_lit(item)}"
+           +(f" AND billing_month={sql_lit(str(bm))}" if bm else "")+" ORDER BY gas_day")
+        d=run_sql(q)
+        if len(d)==0:
+            st.info("No gas-day detail saved for this month yet. Re-run the check for this month (gas-day detail is saved from v1.7.0 onwards).")
+            return
+        d=to_num(d,_DAILY_NUM); unit=str(d["unit"].dropna().iloc[0]) if d["unit"].notna().any() else ""
+        d["flag"]=d["flag"].fillna("")
+        nflag=int((d["flag"]!="").sum())
+        only=st.toggle(f"Only flagged days ({nflag})",value=False,key=key+"_only")
+        v=d[["flag","gas_day"]+_DAILY_NUM].copy()
+        if only: v=v[v["flag"]!=""]
+        if len(v):
+            s_=lambda c: v[c].sum(min_count=1)
+            iv,ie,ev,ee=s_("invoice_volume"),s_("invoice_eur"),s_("equinor_volume"),s_("equinor_eur")
+            dv=(ev-iv) if pd.notna(ev) and pd.notna(iv) else None
+            tot=dict(flag="",gas_day="Total",invoice_volume=iv,invoice_eur=ie,invoice_price=(ie/iv if pd.notna(ie) and iv else None),
+                     equinor_volume=ev,equinor_eur=ee,equinor_price=(ee/ev if pd.notna(ee) and ev else None),
+                     diff_volume=dv,diff_eur=(ee-ie if pd.notna(ee) and pd.notna(ie) else None),diff_pct=(dv/abs(iv)*100 if dv is not None and iv else None))
+            v=pd.concat([v,pd.DataFrame([tot])],ignore_index=True)
+        disp,ncd,_=for_display(v,_DAILY_NUM)
+        fmt={c:("{:,.6f}" if "Price" in c else "{:,.2f}") for c in ncd}
+        def _rs(r):
+            if str(r["Flag"] or "")!="": return ["background-color:#ffcdd2"]*len(r)
+            if r["Gas Day"]=="Total": return ["font-weight:bold;background-color:#eeeeee"]*len(r)
+            return [""]*len(r)
+        st.dataframe(disp.style.format(fmt,na_rep="").apply(_rs,axis=1),use_container_width=True,hide_index=True)
+        st.caption(f"Volumes in {unit}, prices in EUR per {unit}. Red = flagged day. The Total row adds up to the monthly figure in the summary"
+                   +(" (ZTP Trading: Entry + Exit; Equinor = exit x 2)." if item=="ZTP Trading" else ".")
+                   +" Always shows the latest run for the month.")
+
 # === EXCEL EXPORT ===
-def build_results_excel(sections, month_label):
-    """One sheet per section (Capacity M, M-1, Variable Fees M-3, Self Bill).
-    Each sheet: title + caption, summary table, two blank rows, flagged-issues table.
-    Columns match what the Results tab shows on screen."""
+def build_results_excel(sections, month_label, daily_df=None):
+    """Three sheets: 'Monthly summary' (every section's summary table), 'Gas-day detail' (every gas day of the
+    daily items) and 'Flagged' (every section's flagged issues). Columns match the Results tab."""
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
-    hdr_fill = {"summary": PatternFill("solid", fgColor="2196F3"), "flagged": PatternFill("solid", fgColor="FF5722")}
+    hdr = {"summary": PatternFill("solid", fgColor="2196F3"), "daily": PatternFill("solid", fgColor="607D8B"), "flagged": PatternFill("solid", fgColor="FF5722")}
     ok_fill = PatternFill("solid", fgColor="C8E6C9"); bad_fill = PatternFill("solid", fgColor="FFCDD2")
+    def block(xw, ws, sheet, row, label, df, kind, empty):
+        ws.cell(row=row, column=1, value=label).font = Font(bold=True, size=12); row += 1
+        if df is None or len(df) == 0:
+            ws.cell(row=row, column=1, value=empty).font = Font(italic=True); return row + 3
+        df.to_excel(xw, sheet_name=sheet, index=False, startrow=row - 1)
+        for ci, col in enumerate(df.columns, start=1):
+            if pd.api.types.is_numeric_dtype(df[col]):
+                f_ = "#,##0.000000" if "price" in str(col).lower() else "#,##0.00"
+                for ri in range(len(df)): ws.cell(row=row + 1 + ri, column=ci).number_format = f_
+            c = ws.cell(row=row, column=ci); c.fill = hdr[kind]; c.font = Font(bold=True, color="FFFFFF"); c.alignment = Alignment(wrap_text=True)
+            lc = str(col).lower()
+            if "status" in lc or "verdict" in lc:
+                for ri in range(len(df)):
+                    v = str(df.iloc[ri][col] or "")
+                    if "OK" in v or "VERIFIED" in v: ws.cell(row=row + 1 + ri, column=ci).fill = ok_fill
+                    elif "D " in v or "REVIEW" in v or "No" in v: ws.cell(row=row + 1 + ri, column=ci).fill = bad_fill
+        if kind == "daily" and "Flag" in df.columns:  # whole row red for flagged gas days
+            for ri in range(len(df)):
+                if str(df.iloc[ri]["Flag"] or "") not in ("", "nan", "None"):
+                    for ci in range(1, len(df.columns) + 1): ws.cell(row=row + 1 + ri, column=ci).fill = bad_fill
+        return row + len(df) + 3
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        for title, caption, sdf, ftitle, fdf in sections:
-            sheet = title.replace("/", "-")[:31]
+        for sheet, kind in (("Monthly summary", "summary"), ("Gas-day detail", "daily"), ("Flagged", "flagged")):
             pd.DataFrame().to_excel(xw, sheet_name=sheet, index=False)
             ws = xw.sheets[sheet]
-            ws.cell(row=1, column=1, value=f"{title} - {month_label}").font = Font(bold=True, size=14)
-            ws.cell(row=2, column=1, value=caption).font = Font(italic=True, color="666666")
-            row = 4
-            for kind, label, df in (("summary", title, sdf), ("flagged", ftitle, fdf)):
-                ws.cell(row=row, column=1, value=label).font = Font(bold=True, size=12)
-                row += 1
-                if df is None or len(df) == 0:
-                    ws.cell(row=row, column=1, value="No data." if kind == "summary" else "No flagged issues.").font = Font(italic=True)
-                    row += 1
+            ws.cell(row=1, column=1, value=f"{sheet} - {month_label}").font = Font(bold=True, size=14)
+            row = 3
+            if kind == "summary":
+                for title, caption, sdf, ftitle, fdf in sections:
+                    row = block(xw, ws, sheet, row, f"{title} \u2014 {caption}", sdf, kind, "No data.")
+            elif kind == "flagged":
+                for title, caption, sdf, ftitle, fdf in sections:
+                    row = block(xw, ws, sheet, row, ftitle, fdf, kind, "No flagged issues.")
+            else:
+                ws.cell(row=2, column=1, value="Every gas day of Energy in Cash, ZTP Trading and Allocation Settlement (latest run). Red = flagged day.").font = Font(italic=True, color="666666")
+                if daily_df is None or len(daily_df) == 0:
+                    row = block(xw, ws, sheet, row, "Gas-day detail", None, kind, "No gas-day detail saved yet - re-run the month.")
                 else:
-                    df.to_excel(xw, sheet_name=sheet, index=False, startrow=row - 1)
-                    for ci, col in enumerate(df.columns, start=1):  # thousands separator + 2 dp
-                        if pd.api.types.is_numeric_dtype(df[col]):
-                            for ri in range(len(df)): ws.cell(row=row + 1 + ri, column=ci).number_format = "#,##0.00"
-                    for ci in range(1, len(df.columns) + 1):
-                        c = ws.cell(row=row, column=ci); c.fill = hdr_fill[kind]
-                        c.font = Font(bold=True, color="FFFFFF"); c.alignment = Alignment(wrap_text=True)
-                    # colour status / verdict cells like the on-screen table
-                    for ci, col in enumerate(df.columns, start=1):
-                        if "status" in col.lower() or "verdict" in col.lower():
-                            for ri in range(len(df)):
-                                v = str(df.iloc[ri][col] or "")
-                                if "OK" in v or "VERIFIED" in v: ws.cell(row=row + 1 + ri, column=ci).fill = ok_fill
-                                elif "D " in v or "REVIEW" in v or "No" in v: ws.cell(row=row + 1 + ri, column=ci).fill = bad_fill
-                    row += len(df) + 1
-                row += 2  # gap between summary and flagged tables
+                    for item, g in daily_df.groupby("Item", sort=False):
+                        row = block(xw, ws, sheet, row, str(item), g.drop(columns=["Item"]), kind, "")
             for ci in range(1, ws.max_column + 1):
-                width = max((len(str(ws.cell(row=r, column=ci).value or "")) for r in range(4, ws.max_row + 1)), default=8)
+                width = max((len(str(ws.cell(row=r, column=ci).value or "")) for r in range(3, ws.max_row + 1)), default=8)
                 ws.column_dimensions[get_column_letter(ci)].width = min(max(width + 2, 10), 60)
     return buf.getvalue()
 
@@ -1063,18 +1153,17 @@ with t3:
                     raw_s=ds.copy(); ds,nc,sc=for_display(ds,nc,sc)
                     ev=st.dataframe(styled(ds,nc,sc),use_container_width=True,hide_index=True,
                                     on_select="rerun",selection_mode="single-row",key=f"sel_{title}_s")
-                    st.caption("Select a row to see the raw Endur deals behind it.")
-                    if ev and ev.selection.rows: render_endur_panel(raw_s.iloc[ev.selection.rows[0]].to_dict(),f"ep_{title}_s")
+                    st.caption("Select a row to see the detail behind it: raw Endur deals for capacity rows, or every gas day for Energy in Cash, ZTP Trading and Allocation Settlement.")
+                    if ev and ev.selection.rows:
+                        r_=raw_s.iloc[ev.selection.rows[0]].to_dict()
+                        if _daily_item(r_): render_daily_panel(r_,mf,f"dp_{title}")
+                        else: render_endur_panel(r_,f"ep_{title}_s")
                 else: st.info("No data.")
-                st.markdown(f"### {ft}")
+                # flagged issues are no longer shown on screen (gas-day panel replaces them); kept for the Excel 'Flagged' sheet
                 df=run_sql(fsql)
                 if len(df)>0:
                     nc=[c for c in df.columns if any(k in c.lower() for k in ["eur","kwh","volume","diff","pct","gap"])]
-                    df=to_num(df,nc); raw_f=df.copy(); df,nc,_=for_display(df,nc)
-                    ev=st.dataframe(styled(df,nc),use_container_width=True,hide_index=True,
-                                    on_select="rerun",selection_mode="single-row",key=f"sel_{title}_f")
-                    if ev and ev.selection.rows: render_endur_panel(raw_f.iloc[ev.selection.rows[0]].to_dict(),f"ep_{title}_f")
-                else: st.success("No flagged issues.")
+                    df=to_num(df,nc); df,nc,_=for_display(df,nc)
                 sections.append((title,caption,ds,ft,df))
             show("Capacity M","Capacity bookings where the billing month equals the invoice month.",
                 f"SELECT endur_deal_numbers,billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {S('be_m','M')} ORDER BY direction,location",
@@ -1087,12 +1176,12 @@ with t3:
                 "Capacity M-1 - Flagged Issues")
             st.divider()
             show("Variable Fees M-3","Variable fees and energy in cash for the invoice month (gas month is M-3).",
-                f"SELECT endur_deal_numbers,billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,diff_pct AS qty_diff_pct,status AS verdict FROM {S('be_m_minus_3','M-3')} ORDER BY type",
+                f"SELECT endur_deal_numbers,billing_month,type AS line_type,product_name AS item,invoice_eur,equinor_eur,diff_eur AS eur_diff,diff_pct AS qty_diff_pct,status AS verdict FROM {S('be_m_minus_3','M-3')} ORDER BY type,product_name",
                 f"SELECT {FSEL(den='eur_diff')} FROM {F('be_m_minus_3_flagged','M-3')} ORDER BY gas_day",
                 "Variable Fees M-3 - Flagged Issues")
             st.divider()
             show("Self Bill","Sales H Grid (allocation settlement)",
-                f"SELECT endur_deal_numbers,billing_month,type AS line_type,invoice_eur,equinor_eur,diff_eur AS eur_diff,status AS verdict FROM {S('be_alloc','Alloc')}",
+                f"SELECT endur_deal_numbers,billing_month,type AS line_type,product_name AS item,invoice_eur,equinor_eur,diff_eur AS eur_diff,status AS verdict FROM {S('be_alloc','Alloc')}",
                 f"SELECT {FSEL(den='eur_diff')} FROM {F('be_alloc_flagged','Alloc')} ORDER BY gas_day",
                 "Sales H Grid - Flagged Issues")
             st.divider()
@@ -1100,7 +1189,12 @@ with t3:
             xkey="xlsx_"+"|".join(sms)+(f"|{src_run}" if src_run else "")
             if st.button("Prepare download"):
                 with st.spinner("Building Excel file..."):
-                    st.session_state[xkey]=build_results_excel(sections,ml)
+                    dd_=run_sql(f"SELECT item,check_month,billing_month,gas_day,flag,invoice_volume,invoice_eur,invoice_price,equinor_volume,equinor_eur,equinor_price,diff_volume,diff_eur,diff_pct,unit FROM {SCHEMA}.be_daily WHERE check_month IN ({mf}) ORDER BY check_month,section,item,gas_day")
+                    if len(dd_):
+                        dd_=to_num(dd_,_DAILY_NUM); dd_["check_month"]=dd_["check_month"].apply(_fmt_month); dd_["billing_month"]=dd_["billing_month"].apply(_fmt_month)
+                        dd_=dd_.rename(columns={c:pretty_col(c) for c in dd_.columns})
+                    else: dd_=None
+                    st.session_state[xkey]=build_results_excel(sections,ml,dd_)
             if st.session_state.get(xkey):
                 st.download_button("Download Excel",st.session_state[xkey],
                     file_name=f"Belgium_Invoice_Check_{ml.replace(' ','_').replace(',','')}.xlsx",
