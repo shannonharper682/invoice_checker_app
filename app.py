@@ -14,7 +14,7 @@ from databricks.sdk.core import Config
 SCHEMA = "ms_vulcan_gpgtopm_plab.belgium_app_demo_v1"
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.7.0"
+BASE_VERSION = "1.7.2"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -243,6 +243,75 @@ def _dn(df):
     v=sorted({int(x) for x in df["deal_number"].dropna()})
     return ", ".join(str(x) for x in v) if v else None
 
+def _deal_eur(fr_):
+    """Endur EUR for a group of deal rows = SUM over rows of (signed volume x price), so buys and sells net out.
+    pv.price is EUR/MWh on OCUC/bilateral deals (>= 0.01) and EUR/kWh on PRISMA deals, so the former is /1000.
+    Zero-price rows (the PRI_SEC sell-backs carved out for Virtualys net billing) are valued at the group's
+    average priced unit rate, so a sell-back reduces EUR at the price that was paid for the capacity."""
+    if fr_ is None or len(fr_)==0: return None
+    vol=fr_["vol"].astype(float); pr=fr_["price"].astype(float)
+    eur=vol*pr/pr.abs().ge(0.01).map({True:1000.0,False:1.0})
+    if "wdf" in fr_: eur=eur*fr_["wdf"].astype(float)  # v1.7.2: within-day deals - Endur price is pro-rated by hours/24
+    z=pr==0
+    if z.any():
+        den=vol[~z].sum()
+        unit=(eur[~z].sum()/den) if den else 0.0
+        eur=eur.where(~z,vol*unit)
+    return abs(float(eur.sum()))
+
+def _last_sunday(y,m):
+    d=date(y,m,calendar.monthrange(y,m)[1]); return d-timedelta(days=(d.weekday()+1)%7)
+
+def _gasday_hours(gd):
+    """Hours in gas day gd (06:00 gd -> 06:00 gd+1 CET): 23 when the clocks go forward that night, 25 when they go back."""
+    nd=gd+timedelta(days=1)
+    if nd==_last_sunday(nd.year,3): return 23
+    if nd==_last_sunday(nd.year,10): return 25
+    return 24
+
+def _pv_hours(r):
+    """(booked hours, within-day price factor) for one Endur profile row.
+    Normal rows: gas-day hours (DST aware) across the row's days. Within-day deals (single-day deal whose
+    start_time != end_time, e.g. 12 -> 6 = 18 h): only the booked hours. Endur pro-rates a within-day deal's
+    price by booked/full-day hours, so the factor (full-day / booked hours) puts it back on the Fluxys tariff basis."""
+    s,e=r["pv_start"],r["pv_end"]
+    full=sum(_gasday_hours(s+timedelta(days=i)) for i in range((e-s).days+1))
+    if r.get("ds")==r.get("dend") and s==e and pd.notna(r.get("st_h")) and pd.notna(r.get("en_h")):
+        sh,eh=int(r["st_h"]),int(r["en_h"])
+        if sh!=eh:
+            h=(eh-sh)%24
+            if full!=24 and (sh>=6 or sh<2): h+=full-24   # clock change at 02:00 falls inside the booking
+            h=max(h,1)
+            # Only single-id PRISMA refs (PRI-<id>-ENTRY/EXIT, e.g. ZPT/Zeebrugge) carry a pro-rated price in Endur
+            # (checked: 159/159 such within-day deals = day price x hours/24). Two-id refs (PRI-<id>-<id>-..., e.g.
+            # Virtualys/VIP BENE) already hold the full per-kWh tariff, so they get no re-basing.
+            pr_=bool(re.match(r"^PRI-\d+-(ENTRY|EXIT)$",str(r.get("reference") or "")))
+            return float(h),(float(full)/h if pr_ else 1.0)
+    return float(full),1.0
+
+def _cap_daily(il, er):
+    """Gas-day breakdown for a Season capacity row: invoice lines vs Endur deals per gas day (kWh/h + EUR)."""
+    rows={}
+    for gd,g in il.groupby("gas_day"):
+        rows[gd]=dict(gas_day=str(gd),invoice_volume=float(g["qty"].sum()),invoice_eur=float(g["billed_amount"].sum()),
+            inv=", ".join(f"{c} ({int(h)}h)" if pd.notna(h) else str(c) for c,h in zip(g["contract_ref"],g["service_hours"])))
+    if er is not None and len(er):
+        for gd,g in er.groupby("pv_start"):
+            r=rows.setdefault(gd,dict(gas_day=str(gd),invoice_volume=None,invoice_eur=None,inv=""))
+            r["equinor_volume"]=float(g["cap_kwh_h"].abs().sum()); r["equinor_eur"]=_deal_eur(g)
+            r["end"]=", ".join(f"{int(n)} ({int(h)}h)" for n,h in zip(g["deal_number"],g["hrs"]))
+    out=[]
+    for gd in sorted(rows):
+        r=rows[gd]; iv,ev,ie,ee=r.get("invoice_volume"),r.get("equinor_volume"),r.get("invoice_eur"),r.get("equinor_eur")
+        if iv is None: fl="In Endur, not on invoice"
+        elif ev is None: fl="On invoice, not in Endur"
+        elif abs(ev-iv)>1: fl="Capacity mismatch"
+        elif ee is not None and ie is not None and abs(ee-ie)>0.5: fl="EUR mismatch"
+        else: fl=""
+        out.append(dict(gas_day=r["gas_day"],invoice_volume=iv,invoice_eur=ie,invoice_price=None,equinor_volume=ev,equinor_eur=ee,equinor_price=None,
+                        flag=fl,detail="Invoice: "+(r.get("inv") or "-")+" | Endur: "+(r.get("end") or "-")))
+    return out
+
 def check_ltc(df_all, inv_month, log):
     df_ltc = df_all[df_all["product_name"].apply(lambda p: p.startswith(_LTC_VALID) or "Auction" in p or "Premium" in p)].copy()
     df_lt = df_ltc[df_ltc["invoice_line_group"].isin(IC_GROUPS)].copy()
@@ -281,7 +350,8 @@ def check_ltc(df_all, inv_month, log):
         l.location_name,l.ng_location_id,CAST(DATE_TRUNC('month',pv.start_date) AS DATE) AS billing_month,
         pv.calculated_profile_volume_kwh AS vol,pv.price,
         pv.calculated_profile_volume_kwh/((DATEDIFF(pv.end_date,pv.start_date)+1)*24) AS cap_kwh_h,
-        pv.calculated_profile_volume_kwh*pv.price AS endur_eur,pv.start_date AS pv_start,
+        pv.calculated_profile_volume_kwh*pv.price AS endur_eur,pv.start_date AS pv_start,pv.end_date AS pv_end,
+        d.start_time AS st_h,d.end_time AS en_h,d.deal_start_date AS ds,d.deal_end_date AS dend,
         CASE WHEN DATEDIFF(d.deal_end_date,d.deal_start_date)>=360 THEN 'Yearly'
              WHEN DATEDIFF(d.deal_end_date,d.deal_start_date)>=85 THEN 'Quarterly'
              WHEN DATEDIFF(d.deal_end_date,d.deal_start_date)>=27 THEN 'Monthly' ELSE 'Daily' END AS bt,
@@ -301,6 +371,14 @@ def check_ltc(df_all, inv_month, log):
     de = to_num(de,["vol","price","cap_kwh_h","endur_eur"])
     de["billing_month"]=pd.to_datetime(de["billing_month"]).dt.date
     de["pv_start"]=pd.to_datetime(de["pv_start"]).dt.date
+    for c_ in ("pv_end","ds","dend"): de[c_]=pd.to_datetime(de[c_]).dt.date
+    de=to_num(de,["st_h","en_h"])
+    # v1.7.2: capacity = volume / booked hours (within-day bookings use their own hours; DST days 23/25 h)
+    hw=de.apply(_pv_hours,axis=1)
+    de["hrs"]=[h for h,_ in hw]; de["wdf"]=[f for _,f in hw]
+    de["cap_kwh_h"]=de["vol"]/de["hrs"]
+    nwd=int((de["wdf"]!=1).sum())
+    if nwd: log(f"Endur: {nwd} within-day profile rows (capacity on booked hours, price re-based to full day)")
     dlt = de[de["bt"]!="Daily"].copy()
     sm = de["bt"]=="Daily"
     if len(sd)>0: sm &= ((de["pv_start"]>=sws)&(de["pv_start"]<=swe))|(de["pv_start"].isin(cds) if cds else False)
@@ -320,25 +398,28 @@ def check_ltc(df_all, inv_month, log):
         edf = (dlt if rt=="LongTerm" else dse)
         edf = edf[edf["ect"]==ct]
         dim=calendar.monthrange(bm.year,bm.month)[1]
-        ec=ee=ep=None
+        ec=ee=ep=None; er=edf.iloc[0:0]
         if el:
             # Endur locations such as 'VIP THE-ZTP BE' hold Entry AND Exit deals -> match on direction too
             er=edf[(edf["ng_location_id"]==el)&(edf["billing_month"]==bm)&(edf["direction"]==d)]
             dn=_dn(er)
             if rt=="LongTerm" and len(er)>0:
                 cs=abs(er["cap_kwh_h"].sum())  # NET capacity (matches v2 notebook)
-                ca=er["cap_kwh_h"].abs().sum()
-                ap=er.apply(lambda x:abs(x["price"])*(24*365/1000 if abs(x["price"])>=0.01 else 24*365),axis=1)
-                wp=(er["cap_kwh_h"].abs()*ap).sum()/ca if ca else None
                 if cs:
-                    ec=float(cs); ep=float(wp) if wp is not None else None
-                    if ep is not None: ee=ec*ep*dim/365
+                    ec=float(cs)
+                    ee=_deal_eur(er)  # v1.7.1: sum of volume x price per deal (was net capacity x |cap|-weighted avg price)
+                    ep=ee/(ec*dim/365) if (ee is not None and ec) else None  # implied EUR/kWh/h/year, for the price check
             elif rt!="LongTerm" and len(er)>0:
                 dd=er["pv_start"].nunique()
                 if dd:
                     ec=float(er["cap_kwh_h"].abs().sum())/dd
-                    ee=float(er["endur_eur"].abs().sum())
-                    vs=float(er["vol"].abs().sum()); ep=ee/vs if vs else None
+                    ee=_deal_eur(er)  # v1.7.1: signed sum (sell-backs now reduce EUR instead of adding to it)
+                    vs=abs(float(er["vol"].sum())); ep=ee/vs if (ee is not None and vs) else None
+        daily=None
+        if rt!="LongTerm":  # v1.7.2: gas-day breakdown for daily (Season) capacity
+            il_=df_lt[(~is_auc)&(df_lt["billing_month"]==bm)&(df_lt["direction"]==d)&(df_lt["location"]==loc)
+                      &(df_lt["service_rate_type"]==rt)&(df_lt["capacity_type"]==ct)]
+            daily=_cap_daily(il_,er)
         ip=float(r["iup"]) if rt=="LongTerm" else (float(r["tariff_eur"])/float(r["tvk"]) if r["tvk"] else None)
         pgp=(ep-ip) if (ep is not None and ip is not None) else None
         pgpp=(pgp/ip*100) if (pgp is not None and ip) else None
@@ -357,7 +438,8 @@ def check_ltc(df_all, inv_month, log):
             gap_eur=round(eq-r["tariff_eur"],2) if eq is not None else None,
             invoice_price=round(ip,9) if ip is not None else None,endur_price=round(ep,9) if ep is not None else None,
             price_gap=round(pgp,9) if pgp is not None else None,
-            price_gap_pct=round(pgpp,3) if pgpp is not None else None,contracts=r["contracts"],endur_deal_numbers=dn))
+            price_gap_pct=round(pgpp,3) if pgpp is not None else None,contracts=r["contracts"],endur_deal_numbers=dn,
+            service_rate_type_=rt,daily=daily))
         if aeur>0:
             bte=None
             if ip: bte=r["ikwh"]*ip*dim/365 if rt=="LongTerm" else r["tvk"]*ip
@@ -401,13 +483,9 @@ def check_ltc(df_all, inv_month, log):
         dim_=calendar.monthrange(bm.year,bm.month)[1]; cap=eur_=None
         if et=="LongTerm":
             cap=abs(float(fr_["cap_kwh_h"].sum()))
-            ca_=fr_["cap_kwh_h"].abs().sum()
-            ap_=fr_.apply(lambda x:abs(x["price"])*(24*365/1000 if abs(x["price"])>=0.01 else 24*365),axis=1)
-            wp_=(fr_["cap_kwh_h"].abs()*ap_).sum()/ca_ if ca_ else None
-            if wp_ is not None: eur_=cap*wp_*dim_/365
         else:
             nd_=fr_["pv_start"].nunique(); cap=float(fr_["cap_kwh_h"].abs().sum())/nd_ if nd_ else None
-            eur_=float(fr_["endur_eur"].abs().sum())
+        eur_=_deal_eur(fr_)  # v1.7.1: sum of volume x price per deal
         return cap,eur_
     def _endur_flag(bm,d,loc,ect,sel,note):
         ecap=0.0; eeur=0.0; ft=None; deals=[]
@@ -739,13 +817,18 @@ def save_results(lc,lf,als,alf,ahf,vfs,vff,eis,eif,df_all,inv_m,ck,inv_file,ack,
             dly.append(dict(check_month=ck,invoice_file=inv_file,billing_month=str(bm) if bm else None,section=sec,item=item,unit=unit,gas_day=r.get("gas_day"),
                 invoice_volume=iv,invoice_eur=ie,invoice_price=ip,equinor_volume=ev,equinor_eur=ee,equinor_price=ep,
                 diff_volume=dv,diff_eur=de,diff_pct=(dv/abs(iv)*100 if (dv is not None and iv) else None),
-                flag=(str(r.get("flag") or "").replace("\u26a0\ufe0f","").strip() or None),run_id=rid,run_timestamp=ts))
+                flag=(str(r.get("flag") or "").replace("\u26a0\ufe0f","").strip() or None),detail=r.get("detail"),run_id=rid,run_timestamp=ts))
     _EIC={"Entry at Interconnection Point":"Energy in Cash - Entry IP","Exit at Domestic Point":"Energy in Cash - Exit Dom","Exit at Interconnection Point":"Energy in Cash - Exit IP"}
     for e in eis: _dl("M-3",ack,_EIC.get(e.get("category"),"Energy in Cash - "+str(e.get("category"))),"kWh",e.get("daily"))
     if vfs: _dl("M-3",ack,"ZTP Trading","MWh",vfs.get("daily"))
     for a in als:
         if a["line"]=="Purchases": _dl("M-3",sck,"Alloc Settlement Buy","kWh",a.get("daily"))
         elif "Sales" in a.get("line",""): _dl("Alloc",sck,"Alloc Settlement Sale","kWh",a.get("daily"))
+    for r in lc:  # Season capacity: one item per route/direction/capacity type
+        if r.get("daily"):
+            bm_=_parse_bm(r.get("billing_month"))
+            sec="M" if bm_==inv_m else ("M-1" if bm_==inv_m1 else "M-3")
+            _dl(sec,r["billing_month"],f"Capacity {r['location']} {r['direction']} {r['capacity_type']} {r.get('service_rate_type_','Season')}","kWh/h",r["daily"])
     log(f"Saving gas-day detail: {len(dly)} rows")
     _sv("be_daily",dly)
     # --- Overview (variable costs): one row per bill item for this invoice month, replaced on every run ---
@@ -892,7 +975,7 @@ def render_endur_panel(row, key):
             where=f"l.ng_location_id='{LOCATION_MAP[loc]}' AND d.instrument_type_name IN ('COMM-CAP-ENTRY','COMM-CAP-EXIT')"
         per=f" AND pv.start_date<='{me}' AND pv.end_date>='{ms}'" if ms else ""  # always just the selected billing month
         q=("SELECT d.deal_number,d.reference,d.instrument_type_name,d.service_type,d.buy_sell_name,d.tran_status,"
-           "d.deal_start_date,d.deal_end_date,d.trade_date,d.para_position,"
+           "d.deal_start_date,d.deal_end_date,d.start_time,d.end_time,d.trade_date,d.para_position,"
            "l.location_name,l.ng_location_id,pv.settlement_type_id,pv.start_date,pv.end_date,pv.price,"
            "pv.calculated_profile_volume_kwh,pv.calculated_profile_volume,pv.calculated_payment,"
            "pv.unit_id,pv.price_unit_id,pv.volume_type_name "
@@ -905,7 +988,7 @@ def render_endur_panel(row, key):
         if len(raw)==0:
             st.warning("No Endur rows found for this selection."); return
         raw=to_num(raw,["para_position","price","calculated_profile_volume_kwh","calculated_profile_volume","calculated_payment"])
-        hc=["deal_number","reference","instrument_type_name","service_type","buy_sell_name","tran_status","deal_start_date","deal_end_date","trade_date","para_position"]
+        hc=["deal_number","reference","instrument_type_name","service_type","buy_sell_name","tran_status","deal_start_date","deal_end_date","start_time","end_time","trade_date","para_position"]
         st.markdown("**Deal header** (`deal_v2latest`)")
         st.dataframe(raw[hc].drop_duplicates(),use_container_width=True,hide_index=True)
         pc=["deal_number","location_name","ng_location_id","settlement_type_id","start_date","end_date","price","calculated_profile_volume_kwh","calculated_profile_volume","calculated_payment","unit_id","price_unit_id","volume_type_name"]
@@ -925,6 +1008,8 @@ def _daily_item(row):
     if t=="Energy in Cash": return _EIC_ITEMS.get(it,"Energy in Cash - "+it)
     if t=="Variable Trading Fee": return "ZTP Trading"
     if t=="Allocation Settlement": return "Alloc Settlement Sale" if "Sale" in it else "Alloc Settlement Buy"
+    cty=str(row.get("capacity_type") or "")
+    if t=="LTC Tariff" and "Season" in cty: return f"Capacity {row.get('location')} {row.get('direction')} {cty}"
     return None
 
 def render_daily_panel(row, mf, key):
@@ -941,13 +1026,18 @@ def render_daily_panel(row, mf, key):
         d["flag"]=d["flag"].fillna("")
         nflag=int((d["flag"]!="").sum())
         only=st.toggle(f"Only flagged days ({nflag})",value=False,key=key+"_only")
-        v=d[["flag","gas_day"]+_DAILY_NUM].copy()
+        cap_=item.startswith("Capacity")
+        if "detail" not in d.columns: d["detail"]=None
+        v=d[["flag","gas_day"]+_DAILY_NUM+["detail"]].copy()
         if only: v=v[v["flag"]!=""]
+        if not cap_ or v["detail"].isna().all(): v=v.drop(columns=["detail"])
         if len(v):
             s_=lambda c: v[c].sum(min_count=1)
             iv,ie,ev,ee=s_("invoice_volume"),s_("invoice_eur"),s_("equinor_volume"),s_("equinor_eur")
+            if cap_:  # capacity: the summary shows average kWh/h per booked day, EUR is a total
+                iv,ev=v["invoice_volume"].mean(),v["equinor_volume"].mean()
             dv=(ev-iv) if pd.notna(ev) and pd.notna(iv) else None
-            tot=dict(flag="",gas_day="Total",invoice_volume=iv,invoice_eur=ie,invoice_price=(ie/iv if pd.notna(ie) and iv else None),
+            tot=dict(flag="",gas_day=("Average kWh/h \u00b7 total EUR" if cap_ else "Total"),invoice_volume=iv,invoice_eur=ie,invoice_price=(ie/iv if pd.notna(ie) and iv else None),
                      equinor_volume=ev,equinor_eur=ee,equinor_price=(ee/ev if pd.notna(ee) and ev else None),
                      diff_volume=dv,diff_eur=(ee-ie if pd.notna(ee) and pd.notna(ie) else None),diff_pct=(dv/abs(iv)*100 if dv is not None and iv else None))
             v=pd.concat([v,pd.DataFrame([tot])],ignore_index=True)
@@ -955,7 +1045,7 @@ def render_daily_panel(row, mf, key):
         fmt={c:("{:,.6f}" if "Price" in c else "{:,.2f}") for c in ncd}
         def _rs(r):
             if str(r["Flag"] or "")!="": return ["background-color:#ffcdd2"]*len(r)
-            if r["Gas Day"]=="Total": return ["font-weight:bold;background-color:#eeeeee"]*len(r)
+            if str(r["Gas Day"]).startswith(("Total","Average")): return ["font-weight:bold;background-color:#eeeeee"]*len(r)
             return [""]*len(r)
         st.dataframe(disp.style.format(fmt,na_rep="").apply(_rs,axis=1),use_container_width=True,hide_index=True)
         st.caption(f"Volumes in {unit}, prices in EUR per {unit}. Red = flagged day. The Total row adds up to the monthly figure in the summary"
@@ -1044,7 +1134,7 @@ with t1:
             exec_sql(f"INSERT INTO {SCHEMA}.invoice_register (file_name,volume_path,invoice_type,invoice_number,invoice_date,invoice_month,net_amount_eur,file_size_bytes,uploaded_by,uploaded_at) VALUES ('{fn}','{dest}','{it}','{hdr['invoice_number']}','{idate}','{im}',{na},{len(raw)},'app_user',CURRENT_TIMESTAMP())")
             st.success(f"{f.name} -> {sub}/ ({it}, {hdr['invoice_number']}, EUR {na:,.2f})")
     st.subheader("Invoice Register")
-    reg=run_sql(f"SELECT invoice_type,invoice_number,invoice_date,invoice_month,net_amount_eur,file_name,last_check_status FROM {SCHEMA}.invoice_register ORDER BY invoice_type,invoice_date")
+    reg=run_sql(f"SELECT invoice_type,invoice_number,invoice_date,invoice_month,net_amount_eur,file_name FROM {SCHEMA}.invoice_register ORDER BY invoice_type,invoice_date")
     if len(reg)>0:
         reg=to_num(reg,["net_amount_eur"]); reg,_,_=for_display(reg)
         st.dataframe(reg,use_container_width=True,hide_index=True)
@@ -1156,8 +1246,9 @@ with t3:
                     st.caption("Select a row to see the detail behind it: raw Endur deals for capacity rows, or every gas day for Energy in Cash, ZTP Trading and Allocation Settlement.")
                     if ev and ev.selection.rows:
                         r_=raw_s.iloc[ev.selection.rows[0]].to_dict()
-                        if _daily_item(r_): render_daily_panel(r_,mf,f"dp_{title}")
-                        else: render_endur_panel(r_,f"ep_{title}_s")
+                        di_=_daily_item(r_)
+                        if di_: render_daily_panel(r_,mf,f"dp_{title}")
+                        if (not di_) or di_.startswith("Capacity"): render_endur_panel(r_,f"ep_{title}_s")  # capacity: gas days, then raw Endur
                 else: st.info("No data.")
                 # flagged issues are no longer shown on screen (gas-day panel replaces them); kept for the Excel 'Flagged' sheet
                 df=run_sql(fsql)
@@ -1189,7 +1280,7 @@ with t3:
             xkey="xlsx_"+"|".join(sms)+(f"|{src_run}" if src_run else "")
             if st.button("Prepare download"):
                 with st.spinner("Building Excel file..."):
-                    dd_=run_sql(f"SELECT item,check_month,billing_month,gas_day,flag,invoice_volume,invoice_eur,invoice_price,equinor_volume,equinor_eur,equinor_price,diff_volume,diff_eur,diff_pct,unit FROM {SCHEMA}.be_daily WHERE check_month IN ({mf}) ORDER BY check_month,section,item,gas_day")
+                    dd_=run_sql(f"SELECT item,check_month,billing_month,gas_day,flag,invoice_volume,invoice_eur,invoice_price,equinor_volume,equinor_eur,equinor_price,diff_volume,diff_eur,diff_pct,unit,detail FROM {SCHEMA}.be_daily WHERE check_month IN ({mf}) ORDER BY check_month,section,item,gas_day")
                     if len(dd_):
                         dd_=to_num(dd_,_DAILY_NUM); dd_["check_month"]=dd_["check_month"].apply(_fmt_month); dd_["billing_month"]=dd_["billing_month"].apply(_fmt_month)
                         dd_=dd_.rename(columns={c:pretty_col(c) for c in dd_.columns})
