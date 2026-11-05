@@ -3,18 +3,21 @@ Streamlit app replicating Invoice Checker Belgium v2 notebook logic.
 Tabs: Upload Invoices | Run Check | Results.
 All data in ms_vulcan_gpgtopm_plab.belgium_app_demo_v1.
 """
-import os, io, time, uuid, calendar, re
+import os, io, time, uuid, calendar, re, json, hashlib
 from datetime import date, datetime, timedelta
 import xml.etree.ElementTree as ET
 import pandas as pd
 import streamlit as st
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.core import Config
+from databricks.sdk.service.sql import StatementParameterListItem
 
 SCHEMA = "ms_vulcan_gpgtopm_plab.belgium_app_demo_v1"
+FLAG_EUR = 1.0  # v1.11.0: flag every difference of 1 EUR or more (capacity, auction premium, variable fee, energy in cash, allocation)
+AI_MODEL = os.environ.get("AI_MODEL", "databricks-claude-sonnet-4-5")  # v1.9.0: Ask AI (called via ai_query on the SQL warehouse)
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.7.2"
+BASE_VERSION = "1.12.0"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -461,21 +464,25 @@ def check_ltc(df_all, inv_month, log):
                     invoice_value=r["invoice_kwh_h"],endur_value=None,gap=None,gap_pct=None,
                     unit="kWh/h",note=f"NO ENDUR MATCH [{ct}]",**_lx(r)))
             else:
+                cf=False
                 if r["endur_kwh_h"]!=r["invoice_kwh_h"]:
                     g=r["endur_kwh_h"]-r["invoice_kwh_h"]
                     gp=round(g/r["invoice_kwh_h"]*100,3) if r["invoice_kwh_h"] else None
-                    if gp is not None and abs(gp)>1:
+                    if abs(g)>0.5:  # v1.11.0: any capacity difference (was > 1 %)
                         flags.append(dict(type=r["service_rate_type"],gas_day=bms,direction=d,location=loc,
                             invoice_value=r["invoice_kwh_h"],endur_value=r["endur_kwh_h"],
-                            gap=g,gap_pct=gp,unit="kWh/h",note=f"capacity rate mismatch [{ct}]",**_lx(r)))
-                if r.get("price_gap_pct") is not None and not pd.isna(r.get("price_gap_pct")) and abs(r["price_gap_pct"])>1:
+                            gap=g,gap_pct=gp,unit="kWh/h",note=f"capacity rate mismatch [{ct}]",**_lx(r))); cf=True
+                ge=r.get("gap_eur")
+                if not cf and ge is not None and not pd.isna(ge) and abs(ge)>=FLAG_EUR:  # v1.11.0: any EUR difference >= 1 EUR (was price gap > 1 %)
+                    pg=r.get("price_gap_pct")
                     flags.append(dict(type=r["service_rate_type"],gas_day=bms,direction=d,location=loc,
-                        invoice_value=r.get("invoice_price"),endur_value=r.get("endur_price"),gap=r.get("price_gap"),gap_pct=r["price_gap_pct"],
-                        unit="EUR/unit",note=f"price mismatch [{ct}]",**_lx(r)))
+                        invoice_value=r.get("invoice_eur"),endur_value=r.get("equinor_eur"),gap=ge,
+                        gap_pct=round(ge/r["invoice_eur"]*100,3) if r.get("invoice_eur") else None,unit="EUR",
+                        note=f"EUR difference [{ct}]"+(f" (price gap {pg:+.3f}%)" if pg is not None and not pd.isna(pg) else ""),**_lx(r)))
         elif lt=="Auction Premium":
             if r.get("gap_eur") is not None and not pd.isna(r.get("gap_eur")) and r["invoice_eur"]:
                 gp=round(r["gap_eur"]/r["invoice_eur"]*100,3)
-                if abs(gp)>1:
+                if abs(r["gap_eur"])>=FLAG_EUR:  # v1.11.0: was > 1 %
                     flags.append(dict(type="AuctionPremium",gas_day=bms,direction=d,location=loc,
                         invoice_value=r["invoice_eur"],endur_value=r["equinor_eur"],gap=r["gap_eur"],gap_pct=gp,
                         unit="EUR",note=f"auction premium EUR mismatch [{ct}]",**_lx(r,vol=False)))
@@ -559,7 +566,7 @@ def check_alloc(bill_xml,sb_xml,ss,se,log):
         ac.loc[(ac["sqk"]>0)&(ac["esk"]==0),"flag"]="Self-bill entry, no dispatch sale"
         ac.loc[(ac["esk"]>10)&(ac["sqk"]==0),"flag"]="Dispatch sale, no self-bill entry"
         ac.loc[(ac["flag"]=="")&(ac["qd"].abs()>10),"flag"]="Qty mismatch"
-        ac.loc[(ac["flag"]=="")&(ac["ed"].abs()>1.0),"flag"]="EUR mismatch"
+        ac.loc[(ac["flag"]=="")&(ac["ed"].abs()>=FLAG_EUR),"flag"]="EUR mismatch"
     af = ac[ac["flag"]!=""].copy()
     ipe=ac["beur"].sum(); ipk=ac["bqk"].sum(); ise=ac["seur"].sum(); isk=ac["sqk"].sum()
     epe=ac["epe"].sum(); epk2=ac["epk"].sum(); ese=ac["ese"].sum(); esk2=ac["esk"].sum()
@@ -621,6 +628,7 @@ def check_vf(df_all,ms,me,ck,log):
     sf=vc["xqm"].replace(0,float("nan")); vc["xdp"]=(vc["xdm"]/sf*100).round(2)
     vc["exc"]=vc["exm"]*up; vc["cd"]=vc["exc"]-vc["xae"]; vc["flag"]=""
     vc.loc[vc["xdp"].abs()>1,"flag"]="\u26a0\ufe0f EXIT"
+    vc.loc[(vc["flag"]=="")&((vc["exc"]*2-vc["tae"]).abs()>=FLAG_EUR),"flag"]="\u26a0\ufe0f EUR"  # v1.11.0: any day with >= 1 EUR difference
     vfl=vc[vc["flag"]!=""]
     iet=vc["xqm"].sum(); eet=vc["exm"].sum(); evdp=(eet-iet)/iet*100 if iet else 0
     igt=vc["tae"].sum(); egt=vc["exc"].sum()*2; gtd=egt-igt
@@ -667,6 +675,7 @@ def check_eic(df_all,ms,me,ck,log):
         cp["flag"]=""; he=~((cp["eqty"].fillna(0).abs()<0.0001)&(cp["iq"].isna()))
         cp.loc[he&(cp["qdp"].abs()>1),"flag"]="\u26a0\ufe0f QTY"
         cp.loc[he&(~cp["pm"]),"flag"]=cp.loc[he&(~cp["pm"]),"flag"]+" \u26a0\ufe0f PRICE"
+        cp.loc[he&(cp["flag"]=="")&(cp["ad"].abs()>=FLAG_EUR),"flag"]="\u26a0\ufe0f EUR"  # v1.11.0: any day with >= 1 EUR difference
         iqs=iv["iq"].sum(); eqs=cp["eqty"].sum()
         it=iv["ia"].sum(); et=cp["ea"].sum(); ed=et-it
         v="VERIFIED" if (it and abs(ed/it*100)<0.1 and cp["pm"].all()) else "REVIEW REQUIRED"
@@ -931,7 +940,7 @@ def render_run_summary(lr):
     st.caption(f"Run {lr['rid']} \u00b7 {_ts_label(lr['ts'])} \u00b7 {lr['bill']}")
     fl=lr["flags"]
     if not fl:
-        st.success("No flagged issues \u2014 every check matched within tolerance.")
+        st.success(f"No flagged issues \u2014 every check matched to within {FLAG_EUR:.0f} EUR.")
         return
     st.error(f"{len(fl)} flagged issue(s) found. Review below, then add comments in the Run History tab.")
     cnt=pd.DataFrame(fl).groupby(["period","type"]).size().reset_index(name="flags")
@@ -997,6 +1006,375 @@ def render_endur_panel(row, key):
         st.caption("Raw, unprocessed and live from Endur (as it is now, not as it was at the time of the run). "
                    "All rows are shown, including price = 0 rows and every settlement type; the check itself only uses "
                    "settlement_type_id = 1 with price \u2260 0 (plus zero-price PRI_SEC sells where applicable).")
+        if deals and "LongTerm" in str(row.get("capacity_type") or ""): _endur_calc(raw)
+        return raw
+
+def _period_hours(s,e):
+    return sum(_gasday_hours(s+timedelta(days=i)) for i in range((e-s).days+1))
+
+def _endur_calc(raw):
+    """v1.8.0: worked calculation behind the Equinor side - the priced rows the check uses, signed and netted."""
+    c=raw[(raw["settlement_type_id"].astype(str)=="1")&(raw["price"]!=0)].copy()
+    if len(c)==0: return
+    c["s"]=pd.to_datetime(c["start_date"]).dt.date; c["e"]=pd.to_datetime(c["end_date"]).dt.date
+    c["hours"]=[_period_hours(s,e) for s,e in zip(c["s"],c["e"])]
+    c["kwh"]=-c["calculated_profile_volume_kwh"]          # Endur stores buys negative: flip so buys are +
+    c["kwh_h"]=c["kwh"]/c["hours"]
+    big=c["price"].abs()>=0.01
+    c["price_unit"]=big.map({True:"EUR/MWh",False:"EUR/kWh"})
+    c["eur"]=c["kwh"]*c["price"]/big.map({True:1000.0,False:1.0})
+    c["eur_mwh"]=c["price"].where(big,c["price"]*1000)
+    v=c[["deal_number","reference","buy_sell_name","start_date","end_date","hours","kwh","kwh_h","price","price_unit","eur_mwh","eur"]].copy()
+    v["deal_number"]=v["deal_number"].astype(str)
+    tot=dict(deal_number="Net",reference="",buy_sell_name="",start_date="",end_date="",hours=None,kwh=c["kwh"].sum(),
+             kwh_h=c["kwh_h"].sum(),price=None,price_unit="",eur_mwh=(c["eur"].sum()/c["kwh"].sum()*1000 if c["kwh"].sum() else None),eur=c["eur"].sum())
+    v=pd.concat([v,pd.DataFrame([tot])],ignore_index=True)
+    v=v.rename(columns={"deal_number":"Deal","reference":"Reference","buy_sell_name":"Buy/Sell","start_date":"From","end_date":"To",
+        "hours":"Hours","kwh":"Volume kWh","kwh_h":"Capacity kWh/h","price":"Endur price","price_unit":"Price unit","eur_mwh":"Price EUR/MWh","eur":"EUR"})
+    st.markdown("**How the Equinor side is calculated** (priced rows only, netted)")
+    st.dataframe(v.style.format({"Hours":"{:,.0f}","Volume kWh":"{:,.0f}","Capacity kWh/h":"{:,.0f}","Endur price":"{:,.9f}","Price EUR/MWh":"{:,.6f}","EUR":"{:,.2f}"},na_rep="")
+                 .apply(lambda r:["font-weight:bold;background-color:#eeeeee"]*len(r) if r["Deal"]=="Net" else [""]*len(r),axis=1),
+                 use_container_width=True,hide_index=True)
+    st.caption("Volume = calculated_profile_volume_kwh with buys + and sells \u2212. Capacity = volume \u00f7 gas-day hours in the period. "
+               "EUR = volume \u00d7 price (\u00f7 1000 when the price is EUR/MWh, i.e. OCUC/bilateral deals; PRISMA deals are EUR/kWh). "
+               "A buy and a sell of the same capacity at the same price cancel out. Zero-price PRI_SEC sell-backs (Virtualys) "
+               "are not listed here; the check values them at the average price.")
+
+# === INVOICE PANEL (Results tab: capacity row -> the Fluxys bill lines behind it + reconciliation) ===
+_PF_OK=re.compile(r"^[A-Za-z0-9_*/+\-(). ]+$")
+
+def parse_cap_lines(xml_bytes, groups=IC_GROUPS):
+    """Every BilledQuantity on a bill (capacity groups by default; groups=None = all lines) with its full price
+    formula (QTY, UP, BILLp, UNITp, SCmm, NYM ...)."""
+    rows=[]
+    for prod in ET.parse(io.BytesIO(xml_bytes)).getroot().iter("CustomerProduct"):
+        pn=(prod.findtext("ProductName") or "").strip()
+        for il in prod.findall(".//InvoiceLine[@InvoiceLineSequence]"):
+            lg=(il.findtext("InvoiceLineGroup") or "").strip()
+            if groups is not None and lg not in groups: continue
+            ln=(il.findtext("InvoiceLine") or "").strip(); dt_=(il.findtext("InvoiceLineDetail") or "").strip(); bs=il.findtext("BillingStartDate")
+            for bq in il.findall(".//BilledQuantity"):
+                ai=bq.find("AdditionalInformation"); pfi=bq.find("PriceFormulaInformation")
+                g=(lambda t,ai=ai: ai.findtext(t)) if ai is not None else (lambda t: None)
+                vals={}; fml=qu=uu=None
+                if pfi is not None:
+                    for ch in pfi:
+                        if ch.tag=="Formula": fml=ch.get("Formula"); continue
+                        v=ch.get(ch.tag) if ch.get(ch.tag) is not None else ch.text
+                        try: vals[ch.tag]=float(v)
+                        except (TypeError,ValueError): pass
+                    qe=pfi.find("QTY"); ue=pfi.find("UP")
+                    qu=qe.get("QTYUnit") if qe is not None else None; uu=ue.get("UPUnit") if ue is not None else None
+                rc=None
+                if fml and _PF_OK.match(fml):
+                    try: rc=float(eval(fml,{"__builtins__":{}},dict(vals)))  # arithmetic only (checked by _PF_OK)
+                    except Exception: rc=None
+                other=", ".join(f"{k}={v:g}" for k,v in vals.items() if k not in ("QTY","UP","BILLp","UNITp"))
+                rows.append(dict(product=pn,group=lg,location=ln,detail=dt_,billing_start=bs,billing_type=(il.findtext("BillingType") or "").strip(),direction=g("Direction"),
+                    rate_type=g("ServiceRateType"),capacity_type=g("CapacityType"),contract_ref=g("ContractReference"),
+                    service_ref=g("ServiceReference"),service_start=g("ServiceStartGasDay"),service_end=g("ServiceEndGasDay"),
+                    econ_start=bq.findtext("EconomicStartDate"),econ_end=bq.findtext("EconomicEndDate"),
+                    qty=vals.get("QTY"),qty_unit=qu,unit_price=vals.get("UP"),up_unit=uu,bill_p=vals.get("BILLp"),unit_p=vals.get("UNITp"),
+                    other=other,formula=fml,recalc_eur=rc,billed_eur=float(bq.findtext("BilledQuantityAmount") or 0),
+                    cp=g("ConnectionPointName")))
+    return pd.DataFrame(rows)
+
+def _bill_files(mf):
+    return run_sql(f"SELECT DISTINCT r.file_name,r.volume_path FROM {SCHEMA}.invoice_register r JOIN "
+                   f"(SELECT invoice_file FROM {SCHEMA}.be_m WHERE check_month IN ({mf}) UNION "
+                   f"SELECT invoice_file FROM {SCHEMA}.be_m_minus_1 WHERE check_month IN ({mf}) UNION "
+                   f"SELECT invoice_file FROM {SCHEMA}.be_m_minus_3 WHERE check_month IN ({mf})) b ON r.file_name=b.invoice_file")
+
+# === v1.12.0: invoice lines behind the daily items (Energy in Cash, ZTP Trading, Allocation Settlement) ===
+def _bill_and_selfbill_files(mf):
+    b=_bill_files(mf)
+    if len(b)==0: return b
+    s=run_sql(f"SELECT DISTINCT s.file_name,s.volume_path FROM {SCHEMA}.invoice_register r JOIN {SCHEMA}.invoice_register s "
+              f"ON s.invoice_number=r.paired_invoice_number AND s.invoice_type='Self-Bill' "
+              f"WHERE r.file_name IN ({','.join(sql_lit(x) for x in b['file_name'])})")
+    return pd.concat([b,s],ignore_index=True) if len(s) else b
+
+def _daily_invoice_lines(row, mf):
+    """Bill / self-bill lines behind an Energy in Cash, ZTP Trading or Allocation Settlement row -> (DataFrame, message)."""
+    item=_daily_item(row) or ""; bm=str(row.get("billing_month") or "")[:7]
+    files=_bill_and_selfbill_files(mf)
+    if len(files)==0: return pd.DataFrame(),"The bill for this month was not found in the Invoice Register."
+    parts=[]
+    for fn,vp in zip(files["file_name"],files["volume_path"]):
+        try: d=parse_cap_lines(volume_read(vp),groups=None)
+        except Exception as e: return pd.DataFrame(),f"Could not read {fn}: {e}"
+        if len(d): d["bill"]=fn; parts.append(d)
+    if not parts: return pd.DataFrame(),"No lines found on the bill."
+    d=pd.concat(parts,ignore_index=True)
+    mon=d["econ_start"].fillna(d["billing_start"]).astype(str).str[:7]
+    if item.startswith("Energy in Cash"):
+        m=(d["location"]=="Energy in Cash")&(d["group"]==str(row.get("item") or ""))
+    elif item=="ZTP Trading":
+        m=(d["group"]=="ZTP Trading")&(d["location"]=="Variable Fee")
+    elif item.startswith("Alloc Settlement"):
+        pl=d["product"].str.lower()
+        m=pl.str.contains("allocation settl")&~pl.str.contains("transm|imbal")&pl.str.contains("sales" if "Sale" in item else "purchases")
+    else: return pd.DataFrame(),"No invoice-line view for this row."
+    d=d[m&(mon==bm)] if bm else d[m]
+    return d,(None if len(d) else "No matching lines on the bill.")
+
+def render_daily_invoice_panel(row, d, msg):
+    with st.container():
+        st.markdown(f"**Invoice lines for {row.get('item') or row.get('line_type')} \u00b7 {_fmt_month(row.get('billing_month'))}**")
+        if msg: st.info(msg); return
+        cols=["econ_start","cp","direction","detail","qty","qty_unit","unit_price","up_unit","other","formula","recalc_eur","billed_eur"]+(["bill"] if d["bill"].nunique()>1 else [])
+        v=d.sort_values(["econ_start","cp"],na_position="last")[cols].copy()
+        qu=d["qty_unit"].dropna().unique()
+        tot={c:None for c in cols}; tot.update(econ_start="Total",qty=d["qty"].sum() if len(qu)<=1 else None,
+                                               recalc_eur=d["recalc_eur"].sum(min_count=1),billed_eur=d["billed_eur"].sum())
+        v=pd.concat([v,pd.DataFrame([tot])],ignore_index=True)
+        v=v.rename(columns={"econ_start":"Gas day","cp":"Connection point","direction":"Direction","detail":"Detail","qty":"QTY","qty_unit":"QTY unit",
+            "unit_price":"UP","up_unit":"UP unit","other":"Other factors","formula":"Formula","recalc_eur":"Recalculated EUR","billed_eur":"Billed EUR","bill":"Bill"})
+        st.dataframe(v.style.format({"QTY":"{:,.3f}","UP":"{:,.6g}","Recalculated EUR":"{:,.2f}","Billed EUR":"{:,.2f}"},na_rep="")
+                     .apply(lambda r:["font-weight:bold;background-color:#eeeeee"]*len(r) if r["Gas day"]=="Total" else [""]*len(r),axis=1),
+                     use_container_width=True,hide_index=True)
+        st.caption(f"{len(d)} line(s), raw from the bill XML (self-bill for allocation sales). One line per gas day and connection point; "
+                   "Recalculated EUR = the bill's own formula re-applied, it should match Billed EUR to the cent. "
+                   "The Gas-day breakdown adds these up per day.")
+
+def _ask_ai_ui(title, mf, src_run, r_, raw_e_, il_, rec_, di_):
+    """Ask AI button + result, kept per row (and run) for this session."""
+    rid_="|".join(str(r_.get(k)) for k in ("billing_month","direction","location","line_type","capacity_type","item"))
+    ak_="ai_"+hashlib.md5(f"{title}|{mf}|{src_run}|{rid_}".encode()).hexdigest()[:12]
+    if st.button("Ask AI",key="btn_"+ak_,help="Sends this row, the invoice lines, the Endur / gas-day data and the Belgium checker knowledge base to an AI model and asks for the likely cause."):
+        dly_=None
+        if di_:
+            dly_=run_sql(f"SELECT gas_day,flag,invoice_volume,invoice_price,invoice_eur,equinor_volume,equinor_price,equinor_eur,diff_volume,diff_eur,detail FROM {SCHEMA}.be_daily "
+                         f"WHERE check_month IN ({mf}) AND item={sql_lit(di_)} AND billing_month={sql_lit(str(r_.get('billing_month')))} ORDER BY gas_day")
+        with st.spinner("Asking AI (10-30 seconds)..."):
+            try: st.session_state[ak_]=ask_ai(r_,raw_e_,il_,rec_ or None,dly_)
+            except Exception as e: st.session_state[ak_]=f"AI call failed: {e}"
+    if st.session_state.get(ak_):
+        with st.expander("AI explanation \u25be",expanded=True):
+            st.markdown(st.session_state[ak_])
+            st.caption(f"AI-generated by {AI_MODEL} from the data above and BELGIUM_CHECKER_KNOWLEDGE.md. It can be wrong; check before acting. "
+                       "Click Ask AI again for a fresh answer.")
+
+def _match_cap_lines(d,row):
+    loc,dirn=row.get("location"),row.get("direction"); bm=str(row.get("billing_month") or "")[:7]
+    ct=str(row.get("capacity_type") or "").split(); cap=ct[0] if ct else None; rate=ct[-1] if len(ct)>1 else None
+    base=d[(d["direction"]==dirn)&(d["billing_start"].astype(str).str[:7]==bm)]
+    ia=base["group"].str.contains("Auction Premium")|base["detail"].str.contains("Auction|Premium",case=False,na=False)
+    tar=base[~ia&(base["location"]==loc)]
+    if rate:
+        t2=tar[(tar["rate_type"]==rate)&((tar["capacity_type"]==cap)|tar["capacity_type"].isna())]
+        if len(t2): tar=t2
+    if "Auction" not in str(row.get("line_type") or ""): return tar
+    # auction premium lines carry no location: link them to this location through the AUC- ids on its tariff lines (same rule as the check)
+    ids=set(re.findall(r"AUC-(\d+)"," ".join(tar["contract_ref"].fillna(""))))
+    auc=base[ia]
+    return auc[auc["contract_ref"].fillna("").apply(lambda c: bool(ids&set(re.findall(r"AUC-(\d+)",c))))]
+
+def _invoice_lines(row, mf):
+    """Capacity lines on the bill(s) behind a Results row -> (DataFrame, message when there are none)."""
+    files=_bill_files(mf)
+    if len(files)==0: return pd.DataFrame(),"The bill for this month was not found in the Invoice Register."
+    parts=[]
+    for fn,vp in zip(files["file_name"],files["volume_path"]):
+        try: d=parse_cap_lines(volume_read(vp))
+        except Exception as e: return pd.DataFrame(),f"Could not read {fn}: {e}"
+        if len(d): d["bill"]=fn; parts.append(d)
+    d=_match_cap_lines(pd.concat(parts,ignore_index=True),row) if parts else pd.DataFrame()
+    return d,(None if len(d) else "No matching capacity lines on the bill.")
+
+def render_invoice_panel(row, d, msg):
+    """v1.8.0: the raw Fluxys bill lines behind a capacity row, with the bill's formula re-applied."""
+    with st.container():
+        what=f"{row.get('direction') or ''} {row.get('location') or ''}".strip()
+        st.markdown(f"**Invoice lines for {what} \u00b7 {_fmt_month(row.get('billing_month'))}**")
+        if msg: st.info(msg); return
+        cols=["contract_ref","service_ref","billing_type","service_start","service_end","econ_start","econ_end","rate_type","qty","qty_unit",
+              "unit_price","up_unit","bill_p","unit_p","other","formula","recalc_eur","billed_eur"]+(["bill"] if d["bill"].nunique()>1 else [])
+        v=d[cols].copy()
+        tot={c:None for c in cols}; tot.update(contract_ref="Net",qty=d["qty"].sum() if d["econ_start"].nunique()<=1 else None,
+                                               recalc_eur=d["recalc_eur"].sum(min_count=1),billed_eur=d["billed_eur"].sum())
+        v=pd.concat([v,pd.DataFrame([tot])],ignore_index=True)
+        v=v.rename(columns={"contract_ref":"Contract","service_ref":"Service ref","billing_type":"Billing type","service_start":"Service from","service_end":"Service to",
+            "econ_start":"Billed from","econ_end":"Billed to","rate_type":"Rate type","qty":"QTY","qty_unit":"QTY unit","unit_price":"UP",
+            "up_unit":"UP unit","bill_p":"BILLp (days)","unit_p":"UNITp","other":"Other factors","formula":"Formula",
+            "recalc_eur":"Recalculated EUR","billed_eur":"Billed EUR","bill":"Bill"})
+        st.dataframe(v.style.format({"QTY":"{:,.0f}","UP":"{:,.6g}","BILLp (days)":"{:,.0f}","UNITp":"{:,.0f}","Recalculated EUR":"{:,.2f}","Billed EUR":"{:,.2f}"},na_rep="")
+                     .apply(lambda r:["font-weight:bold;background-color:#eeeeee"]*len(r) if r["Contract"]=="Net" else [""]*len(r),axis=1),
+                     use_container_width=True,hide_index=True)
+        st.caption("Raw from the bill XML (PriceFormulaInformation). Recalculated EUR = the bill's own formula re-applied to its QTY, UP and factors; "
+                   "it should match Billed EUR to the cent. Negative QTY lines are capacity Fluxys moved off a contract (e.g. to an auction contract).")
+
+def _decs(p):
+    """Number of decimals a price is stored with (8 = not visibly rounded)."""
+    for k in range(8):
+        if abs(p-round(p,k))<1e-10: return k
+    return 8
+
+def _deal_contrib(raw, bill_eur_mwh):
+    """v1.9.0: gap by Endur deal = signed MWh x (Endur EUR/MWh - bill EUR/MWh), priced settlement-type-1 rows.
+    'rounded' = the Endur price is the bill tariff rounded to its own number of decimals."""
+    if raw is None or len(raw)==0: return None
+    c=raw[(raw["settlement_type_id"].astype(str)=="1")&(raw["price"]!=0)].copy()
+    if len(c)==0: return None
+    c["mwh"]=-c["calculated_profile_volume_kwh"].astype(float)/1000
+    c["eur_mwh"]=c["price"].where(c["price"].abs()>=0.01,c["price"]*1000)
+    c["reference"]=c["reference"].fillna(""); c["buy_sell_name"]=c["buy_sell_name"].fillna("")
+    g=c.groupby(["deal_number","reference","buy_sell_name","eur_mwh"],as_index=False,dropna=False)["mwh"].sum()
+    g["decimals"]=g["eur_mwh"].apply(_decs)
+    g["rounded"]=[(k<=5 and abs(round(bill_eur_mwh,k)-p)<1e-9) for p,k in zip(g["eur_mwh"],g["decimals"])]
+    g["gap_eur"]=g["mwh"]*(g["eur_mwh"]-bill_eur_mwh)
+    return g
+
+def _reconcile(row,d,raw=None,show=True):
+    """Split gap_eur into a volume effect and a price effect (LongTerm, yearly tariff), and the price effect by Endur deal.
+    Returns False when not applicable. The comment box is rule-based (fixed rules below), not AI-generated."""
+    if len(d)==0 or "LongTerm" not in str(row.get("capacity_type") or "") or "Auction" in str(row.get("line_type") or ""): return False
+    ie,ee,iv,ev=(row.get(k) for k in ("invoice_eur","equinor_eur","invoice_kwh_h","endur_kwh_h"))
+    if any(x is None or pd.isna(x) for x in (ie,ee,iv,ev)) or not ev: return False
+    lt=d[d["bill_p"].notna()&d["qty"].notna()&d["up_unit"].fillna("").str.endswith("/year")]
+    ms,me=_month_bounds(row.get("billing_month"))
+    if len(lt)==0 or ms is None: return False
+    inv_mwh=float((lt["qty"]*lt["bill_p"]*24).sum())/1000
+    end_mwh=float(ev)*_period_hours(ms,me)/1000
+    if not inv_mwh: return False
+    ip=float(ie)/inv_mwh; ep=float(ee)/end_mwh; yr=float(lt["unit_p"].dropna().iloc[0]) if lt["unit_p"].notna().any() else 365.0
+    ups=sorted(lt["unit_price"].dropna().unique())
+    vol_eff=(end_mwh-inv_mwh)*ip; pr_eff=end_mwh*(ep-ip); gap=float(ee)-float(ie)
+    rec=dict(invoice_energy_mwh=round(inv_mwh,3),endur_energy_mwh=round(end_mwh,3),invoice_price_eur_mwh=round(ip,7),
+             endur_price_eur_mwh=round(ep,7),volume_effect_eur=round(vol_eff,2),price_effect_eur=round(pr_eff,2),gap_eur=round(gap,2),
+             rounding_limit_eur=round(end_mwh*0.00005,2))
+    bill=(ups[0]*1000/(yr*24)) if len(ups)==1 else None
+    dc=_deal_contrib(raw,bill) if bill else None
+    if dc is not None:
+        rec["bill_tariff_eur_mwh"]=round(bill,7)
+        rec["gap_by_deal"]=[dict(deal=int(r.deal_number),reference=r.reference,buy_sell=r.buy_sell_name,signed_mwh=round(r.mwh,3),
+            endur_eur_mwh=r.eur_mwh,price_decimals=int(r.decimals),is_bill_tariff_rounded=bool(r.rounded),gap_eur=round(r.gap_eur,2)) for r in dc.itertuples()]
+        rec["gap_not_explained_by_deals_eur"]=round(pr_eff-float(dc["gap_eur"].sum()),2)
+    t=pd.DataFrame([
+        dict(Measure="Capacity (kWh/h)",Invoice=f"{float(iv):,.0f}",Endur=f"{float(ev):,.0f}",Difference=f"{float(ev)-float(iv):,.0f}"),
+        dict(Measure="Energy basis (MWh)",Invoice=f"{inv_mwh:,.3f}",Endur=f"{end_mwh:,.3f}",Difference=f"{end_mwh-inv_mwh:,.3f}"),
+        dict(Measure="Price (EUR/MWh)",Invoice=f"{ip:,.6f}",Endur=f"{ep:,.6f}",Difference=f"{ep-ip:,.6f}"),
+        dict(Measure=f"Price (EUR/kWh/h/year, {yr:.0f} days)",Invoice=f"{ip*yr*24/1000:,.5f}",Endur=f"{ep*yr*24/1000:,.5f}",Difference=f"{(ep-ip)*yr*24/1000:,.5f}"),
+        dict(Measure="EUR",Invoice=f"{float(ie):,.2f}",Endur=f"{float(ee):,.2f}",Difference=f"{gap:,.2f}")])
+    if not show: return rec  # v1.9.1: numbers only (fed to Ask AI); the Invoice vs Endur section is no longer shown
+    with st.container():
+        st.dataframe(t,use_container_width=True,hide_index=True)
+        tariff=(f" Bill tariff: {ups[0]:g} EUR/kWh/h/year = {ups[0]*1000/(yr*24):.6f} EUR/MWh." if len(ups)==1 else "")
+        st.markdown(f"* **Volume effect:** {vol_eff:,.2f} EUR (energy difference \u00d7 invoice price)\n"
+                    f"* **Price effect:** {pr_eff:,.2f} EUR (Endur energy \u00d7 price difference)\n"
+                    f"* **Total:** {gap:,.2f} EUR")
+        if dc is not None:
+            v=dc[["deal_number","reference","buy_sell_name","mwh","eur_mwh","decimals","rounded","gap_eur"]].copy()
+            v["deal_number"]=v["deal_number"].astype(str)
+            rest=pr_eff-float(dc["gap_eur"].sum())
+            if abs(rest)>=0.01: v=pd.concat([v,pd.DataFrame([dict(deal_number="Other",reference="not explained by priced deals (zero-price rows, cent rounding on the bill)",gap_eur=rest)])],ignore_index=True)
+            v=pd.concat([v,pd.DataFrame([dict(deal_number="Total",gap_eur=pr_eff)])],ignore_index=True)
+            v=v.rename(columns={"deal_number":"Deal","reference":"Reference","buy_sell_name":"Buy/Sell","mwh":"Signed MWh","eur_mwh":"Endur EUR/MWh",
+                                "decimals":"Price decimals","rounded":"= bill tariff rounded","gap_eur":"Price effect EUR"})
+            st.markdown(f"**Price effect by Endur deal** (bill tariff {bill:.7f} EUR/MWh)")
+            st.dataframe(v.style.format({"Signed MWh":"{:,.3f}","Endur EUR/MWh":"{:,.9g}","Price decimals":"{:.0f}","Price effect EUR":"{:,.2f}"},na_rep="")
+                         .apply(lambda r:["font-weight:bold;background-color:#eeeeee"]*len(r) if r["Deal"]=="Total" else [""]*len(r),axis=1),
+                         use_container_width=True,hide_index=True)
+        if abs(gap)<0.01: st.success("No difference."); return rec
+        if abs(vol_eff)<0.01 and dc is not None:
+            rnd=dc["rounded"]; cr=float(dc.loc[rnd,"gap_eur"].sum()); cn=float(dc.loc[~rnd,"gap_eur"].sum())
+            if rnd.any() and abs(cn)<0.5 and abs(cr-pr_eff)<0.5:
+                ex=", ".join(f"{int(r.deal_number)} at {r.eur_mwh:g}" for r in dc[rnd].drop_duplicates("deal_number").head(4).itertuples())
+                st.info(f"Volumes match; the whole gap is price rounding. Endur holds the bill tariff rounded to "
+                        f"{'/'.join(str(k) for k in sorted(set(dc.loc[rnd,'decimals'])))} decimals (deal {ex} EUR/MWh vs {bill:.6f} on the bill). "
+                        f"Not a wrong tariff; it only goes away if Endur stores more decimals.{tariff}")
+            else:
+                top=dc.loc[dc["gap_eur"].abs().sort_values(ascending=False).index].head(3)
+                ex="; ".join(f"{int(r.deal_number)} ({r.reference}) {r.eur_mwh:g} EUR/MWh: {r.gap_eur:,.2f} EUR" for r in top.itertuples() if abs(r.gap_eur)>=0.01)
+                st.warning(f"Volumes match; the gap is price and is not just rounding. Biggest contributions: {ex or 'none from priced deals'}. "
+                           f"Check the tariff on those Endur deals.{tariff}")
+        elif abs(vol_eff)<0.01 and abs(pr_eff)<=end_mwh*0.00005+0.01:
+            st.info(f"Volumes match; the whole gap is price. It is within the rounding of a 4-decimal EUR/MWh price "
+                    f"(up to {end_mwh*0.00005:,.2f} EUR on this volume), so it is most likely Endur holding a rounded price, not a wrong tariff.{tariff}")
+        elif abs(vol_eff)<0.01:
+            st.warning(f"Volumes match; the gap is price and too large to be rounding \u2014 check the tariff on the Endur deal.{tariff}")
+        elif abs(pr_eff)<0.01:
+            st.warning("Prices match; the gap is volume \u2014 compare the Endur deals and Invoice lines sections.")
+        else:
+            st.warning(f"Both volume and price differ \u2014 see the effects above.{tariff}")
+        st.caption("Invoice energy = \u03a3 QTY \u00d7 BILLp \u00d7 24 h. Endur energy = Endur kWh/h \u00d7 gas-day hours in the month (23/25 h on clock-change days). "
+                   "Volume effect + price effect = the gap exactly. The comment above is chosen by fixed rules on these numbers.")
+    return rec
+
+# === ASK AI (v1.9.0): send the row, Endur rows, bill lines, reconciliation + knowledge base to an LLM ===
+_APP_DIR=os.path.dirname(os.path.abspath(__file__))
+
+@st.cache_data(show_spinner=False)
+def _knowledge():
+    try:
+        with open(os.path.join(_APP_DIR,"BELGIUM_CHECKER_KNOWLEDGE.md"),encoding="utf-8") as f: return f.read()
+    except Exception: return "(knowledge base file not found)"
+
+def _ai_query(prompt):
+    """ai_query on the app's SQL warehouse, as the signed-in user; the prompt is a bound parameter (no escaping issues)."""
+    w=_get_client()
+    resp=w.statement_execution.execute_statement(warehouse_id=WAREHOUSE_ID,statement=f"SELECT ai_query('{AI_MODEL}', :prompt) AS r",
+        parameters=[StatementParameterListItem(name="prompt",value=prompt,type="STRING")],wait_timeout="50s")
+    state=resp.status.state.value if resp.status and resp.status.state else "UNKNOWN"
+    t0=time.time()
+    while state in {"PENDING","RUNNING"} and time.time()-t0<180:
+        time.sleep(2); resp=w.statement_execution.get_statement(resp.statement_id)
+        state=resp.status.state.value if resp.status and resp.status.state else "UNKNOWN"
+    if state!="SUCCEEDED": raise RuntimeError(f"AI call failed: {resp.status.error if resp.status else state}")
+    return (resp.result.data_array or [[""]])[0][0] or ""
+
+def _csv(df,cols=None,n=250):
+    if df is None or len(df)==0: return "(none)"
+    d=df[[c for c in (cols or df.columns) if c in df.columns]]
+    extra=f"\n... {len(d)-n} more rows not shown" if len(d)>n else ""
+    return d.head(n).to_csv(index=False)+extra
+
+def ask_ai(row, raw_e, il, rec, daily):
+    keep=["billing_month","direction","location","line_type","item","capacity_type","invoice_kwh_h","endur_kwh_h","invoice_eur","equinor_eur",
+          "gap_eur","eur_diff","qty_diff_pct","status","verdict","endur_deal_numbers"]
+    rj={k:(None if (isinstance(row.get(k),float) and pd.isna(row.get(k))) else row.get(k)) for k in keep if k in row}
+    ecols=["deal_number","reference","instrument_type_name","service_type","buy_sell_name","tran_status","deal_start_date","deal_end_date",
+           "start_time","end_time","location_name","ng_location_id","settlement_type_id","start_date","end_date","price",
+           "calculated_profile_volume_kwh","calculated_payment"]
+    icols=["contract_ref","service_ref","cp","direction","billing_type","detail","rate_type","capacity_type","service_start","service_end","econ_start","econ_end",
+           "qty","qty_unit","unit_price","up_unit","bill_p","unit_p","other","formula","recalc_eur","billed_eur"]
+    prompt=f"""You are helping a gas transport analyst at Equinor check a Fluxys Belgium invoice against Equinor's own data
+(Endur capacity bookings for capacity rows; dispatch allocations, EEX ZTP prices and shipper volumes for Energy in Cash,
+ZTP Trading and Allocation Settlement rows - see the knowledge base). For daily items the GAS-DAY BREAKDOWN is the comparison per day.
+Use the KNOWLEDGE BASE to understand how the checker lines things up. Look at the ROW, the RECONCILIATION, the INVOICE LINES and the ENDUR ROWS
+and explain the most likely reason for any difference. Also point out anything unusual even if the gap is zero (BackBilling lines,
+Interruptible or over-nomination lines, negative/transfer lines, within-day bookings, clock-change month, PRI_SEC trades, auction premiums,
+prices that look rounded or out of date, deals not Validated, cases the knowledge base says are not handled).
+Rules: use only the data given; quote the actual deal numbers, contracts and numbers; show a short calculation where it helps;
+do not invent data; if the data cannot explain the gap, say so and say what to look at next.
+RECONCILIATION.gap_by_deal is exact arithmetic (signed MWh x (Endur EUR/MWh - bill tariff EUR/MWh)) and sums to the price effect;
+use it rather than doing your own arithmetic. is_bill_tariff_rounded=true means the Endur price is the bill tariff rounded to
+price_decimals decimals. The "Known cases" in the knowledge base can be out of date: if this row's data disagrees, trust the data and say so.
+Answer in markdown, max about 200 words, with exactly these parts:
+**Likely cause:** one or two sentences.
+**Evidence:** 2-5 bullets.
+**What to check or fix:** 1-3 bullets.
+**Confidence:** High, Medium or Low, with a few words why.
+
+=== KNOWLEDGE BASE ===
+{_knowledge()}
+
+=== ROW (Results table, amounts in EUR, capacity in kWh/h) ===
+{json.dumps(rj,default=str)}
+
+=== RECONCILIATION (LongTerm only; volume effect + price effect = gap) ===
+{json.dumps(rec,default=str) if rec else "(not applicable for this row)"}
+
+=== INVOICE LINES (from the bill XML; recalc_eur = bill formula re-applied) ===
+{_csv(il,icols)}
+
+=== ENDUR ROWS (deal + profilevolume, all settlement types, live from Endur) ===
+{_csv(raw_e,ecols)}
+
+=== GAS-DAY BREAKDOWN (Season rows only) ===
+{_csv(daily,None,70)}
+"""
+    return _ai_query(prompt)
 
 # === GAS-DAY PANEL (Results tab: select a daily item -> every gas day, invoice vs Equinor) ===
 _EIC_ITEMS={"Entry at Interconnection Point":"Energy in Cash - Entry IP","Exit at Domestic Point":"Energy in Cash - Exit Dom","Exit at Interconnection Point":"Energy in Cash - Exit IP"}
@@ -1115,51 +1493,226 @@ def _user_email():
     h=st.context.headers
     return h.get("x-forwarded-email") or h.get("x-forwarded-preferred-username") or "app_user"
 
+# === INVOICE REGISTER (v1.10.0): classify uploads by CONTENT (any file name, any month), store by invoice number,
+# pair each bill with its self-bill via the allocation settlement month ===
+def _m1(d):
+    if d is None or (isinstance(d,float) and pd.isna(d)): return None
+    return pd.to_datetime(d).date().replace(day=1)
+
+def read_invoice_meta(raw):
+    """(meta, error). Everything comes from inside the XML; the file name is never used."""
+    try: root=ET.parse(io.BytesIO(raw)).getroot()
+    except Exception: return None,"not a valid XML file"
+    h=root.find("InvoiceDetailHeader")
+    if root.tag!="InvoiceDetail" or h is None:
+        return None,("not a Fluxys invoice DETAIL XML (no InvoiceDetailHeader). If this is the INVXML (summary) file, "
+                     "please download and upload the INVDETXML instead")
+    it=(h.findtext("InvoiceType") or "").strip(); num=(h.findtext("InvoiceNumber") or "").strip()
+    if it not in ("Bill","Self-Bill"): return None,f"unknown InvoiceType '{it}' (expected Bill or Self-Bill)"
+    if not re.fullmatch(r"[A-Za-z0-9_-]+",num): return None,f"missing or invalid InvoiceNumber '{num}'"
+    try: idate=date.fromisoformat((h.findtext("InvoiceDate") or "")[:10])
+    except Exception: return None,"missing or invalid InvoiceDate"
+    try: na=float(h.findtext("InvoiceNetAmount") or 0)
+    except Exception: na=0.0
+    m=dict(invoice_type=it,invoice_number=num,invoice_date=idate,invoice_month=idate.replace(day=1),net_amount=na,
+           document_type=(h.findtext("DocumentType") or "").strip() or "Invoice",applies_to_month=None,alloc_settlement_month=None,
+           has_backbilling=any((il.findtext("BillingType") or "").strip()=="BackBilling" for il in root.iter("InvoiceLine")),
+           file_lines=raw.count(b"\n")+1,detail_rows=sum(1 for _ in root.iter("BilledQuantity")))
+    if it=="Bill":
+        P=detect_periods(parse_invoice_all(raw),idate)   # same period logic as Run Check
+        m["applies_to_month"]=_m1(P["inv_m"]); m["alloc_settlement_month"]=_m1(P["ss"])
+    else:
+        m["alloc_settlement_month"]=_m1(get_alloc_period(raw,"Allocation Settl"))
+    return m,None
+
+def _meta_sql(m):
+    return (f"document_type={sql_lit(m['document_type'])},applies_to_month={sql_lit(m['applies_to_month'])},"
+            f"alloc_settlement_month={sql_lit(m['alloc_settlement_month'])},has_backbilling={sql_lit(bool(m['has_backbilling']))},"
+            f"file_lines={int(m['file_lines'])}")
+
+def _detail_check(fname, m):
+    """v1.10.2 soft check: was the INVDETXML (detail) uploaded and not the INVXML (summary)? Returns the reasons or None."""
+    why=[]; kind="bill" if m["invoice_type"]=="Bill" else "self-bill"
+    if re.search(r"invxml",fname,re.I) and not re.search(r"invdetxml",fname,re.I): why.append("the file name says InvXml")
+    if m["detail_rows"]==0: why.append("it has no detail (BilledQuantity) rows")
+    ref=run_sql(f"SELECT file_lines FROM {SCHEMA}.invoice_register WHERE invoice_type={sql_lit(m['invoice_type'])} "
+                f"AND file_lines IS NOT NULL AND invoice_number<>{sql_lit(m['invoice_number'])}")
+    if len(ref)>=2:
+        med=float(pd.to_numeric(ref["file_lines"]).median())
+        if m["file_lines"]<0.5*med: why.append(f"it has {m['file_lines']:,} lines while other {kind}s have about {med:,.0f}")
+    return "; ".join(why) or None
+
+def _backfill_register():
+    """Rows uploaded before v1.10.0 (or by an older app version): read the stored file once and fill the content columns."""
+    r=run_sql(f"SELECT invoice_number,volume_path FROM {SCHEMA}.invoice_register WHERE document_type IS NULL "
+              f"OR (file_lines IS NULL AND document_type<>'Unreadable')")
+    for _,x in r.iterrows():
+        try: m,err=read_invoice_meta(volume_read(x["volume_path"]))
+        except Exception: m=None
+        sets=_meta_sql(m) if m else "document_type='Unreadable'"
+        exec_sql(f"UPDATE {SCHEMA}.invoice_register SET {sets} WHERE invoice_number={sql_lit(x['invoice_number'])}")
+
+def _pair_register():
+    """Bill <-> self-bill on the same allocation settlement month (closest invoice date wins). Only writes changes."""
+    r=run_sql(f"SELECT invoice_number,invoice_type,invoice_date,alloc_settlement_month,paired_invoice_number FROM {SCHEMA}.invoice_register")
+    if len(r)==0: return
+    b=r[r["invoice_type"]=="Bill"]; s=r[r["invoice_type"]=="Self-Bill"]; want={}
+    for _,x in b.iterrows():
+        if not x["alloc_settlement_month"]: continue
+        c=s[s["alloc_settlement_month"]==x["alloc_settlement_month"]].copy()
+        if len(c)==0: continue
+        c["dd"]=(pd.to_datetime(c["invoice_date"])-pd.to_datetime(x["invoice_date"])).abs()
+        sn=c.sort_values("dd").iloc[0]["invoice_number"]
+        want[x["invoice_number"]]=sn; want.setdefault(sn,x["invoice_number"])
+    for _,x in r.iterrows():
+        w=want.get(x["invoice_number"]); cur=x["paired_invoice_number"] or None
+        if w!=cur: exec_sql(f"UPDATE {SCHEMA}.invoice_register SET paired_invoice_number={sql_lit(w)} WHERE invoice_number={sql_lit(x['invoice_number'])}")
+
+def _upload_one(fname, raw):
+    """Store one uploaded XML. Returns (level, message)."""
+    m,err=read_invoice_meta(raw)
+    if m is None: return "error",f"**Not saved \u2014 {fname}**: {err}.",None
+    num=m["invoice_number"]; sub="bill" if m["invoice_type"]=="Bill" else "self_bill"
+    dest=f"{VOLUME}/{sub}/{num}.xml"   # stored by invoice number
+    # v1.10.1: replace what is already there for the SAME invoice number, or the same month and type
+    # (bill: invoice month it applies to; self-bill: allocation settlement month) - whatever the file name was
+    kc,kv=("applies_to_month",m["applies_to_month"]) if m["invoice_type"]=="Bill" else ("alloc_settlement_month",m["alloc_settlement_month"])
+    cond=f"invoice_number={sql_lit(num)}"+(f" OR (invoice_type={sql_lit(m['invoice_type'])} AND {kc}={sql_lit(kv)})" if kv else "")
+    prev=run_sql(f"SELECT invoice_number,file_name,volume_path,uploaded_at FROM {SCHEMA}.invoice_register WHERE {cond}")
+    volume_write(dest,raw)
+    for op in (prev["volume_path"] if len(prev) else []):
+        if op and op!=dest and op.startswith(VOLUME):
+            try: _get_client().files.delete(op)
+            except Exception: pass
+    exec_sql(f"DELETE FROM {SCHEMA}.invoice_register WHERE {cond}")
+    exec_sql(f"INSERT INTO {SCHEMA}.invoice_register (file_name,volume_path,invoice_type,invoice_number,invoice_date,invoice_month,net_amount_eur,"
+             f"file_size_bytes,uploaded_by,uploaded_at,document_type,applies_to_month,alloc_settlement_month,has_backbilling,file_lines) VALUES "
+             f"({sql_lit(fname)},{sql_lit(dest)},{sql_lit(m['invoice_type'])},{sql_lit(num)},{sql_lit(m['invoice_date'])},{sql_lit(m['invoice_month'])},"
+             f"{m['net_amount']},{len(raw)},{sql_lit(_user_email())},CURRENT_TIMESTAMP(),{sql_lit(m['document_type'])},{sql_lit(m['applies_to_month'])},"
+             f"{sql_lit(m['alloc_settlement_month'])},{sql_lit(bool(m['has_backbilling']))},{int(m['file_lines'])})")
+    what=(f"Bill {num} \u00b7 applies to **{_fmt_month(m['applies_to_month'])}**" if m["invoice_type"]=="Bill"
+          else f"Self-bill {num} \u00b7 allocation settlement **{_fmt_month(m['alloc_settlement_month'])}**" if m["alloc_settlement_month"]
+          else f"Self-bill {num} \u00b7 no allocation settlement found")
+    msg=f"**Saved \u2014 {fname}** \u2192 {what} \u00b7 EUR {m['net_amount']:,.2f}"
+    notes=[]
+    for _,p in prev.iterrows():
+        same="same invoice" if p["invoice_number"]==num else f"{'bill' if m['invoice_type']=='Bill' else 'self-bill'} {p['invoice_number']} for the same month"
+        notes.append(f"replaced {same}, uploaded before as '{p['file_name']}' on {_ts_label(p['uploaded_at'])}")
+    if m["document_type"]!="Invoice": notes.append(f"document type is '{m['document_type']}'")
+    if m["has_backbilling"]: notes.append("contains BackBilling (correction) lines")
+    return "success", msg+(" \u2014 "+"; ".join(notes) if notes else ""), num
+
 with t1:
     st.header("Upload Invoice XML Files")
-    st.caption("Upload Fluxys invoice XMLs. Auto-sorted into bill / self-bill.")
-    files=st.file_uploader("Choose XML files",type=["xml"],accept_multiple_files=True)
+    st.caption("Upload the Fluxys bill and self-bill XMLs exactly as downloaded \u2014 any file name, any month. "
+               "Files are saved automatically as soon as you add them (no separate save button). "
+               "The app reads the type, invoice number and month from inside each file and pairs each bill with its self-bill. "
+               "Uploading a bill (or self-bill) for a month that is already in the register replaces the old one.")
+    # v1.10.3: process the files once, then clear the uploader and show one result box + highlight the rows in the register
+    uk=st.session_state.setdefault("upl_key",0)
+    files=st.file_uploader("Choose XML files",type=["xml"],accept_multiple_files=True,key=f"upl_{uk}")
+    last=st.session_state.setdefault("upload_last",[]); newn=st.session_state.setdefault("upload_new",[])
+    pend=st.session_state.setdefault("upload_pending",{})
     if files:
-        for f in files:
-            raw=f.read(); hdr=parse_xml_header(raw)
-            if hdr is None: st.error(f"{f.name}: not a valid Fluxys XML."); continue
-            it=hdr["invoice_type"]; sub="bill" if it=="Bill" else "self_bill"
-            dest=f"{VOLUME}/{sub}/{f.name}"; volume_write(dest,raw)
-            idate=date.fromisoformat(hdr["invoice_date"]); na=float(hdr["net_amount"]); im=idate.replace(day=1)
-            ex=run_sql(f"SELECT file_name FROM {SCHEMA}.invoice_register WHERE invoice_number='{hdr['invoice_number']}'")
-            if len(ex)>0:
-                exec_sql(f"DELETE FROM {SCHEMA}.invoice_register WHERE invoice_number='{hdr['invoice_number']}'")
-                st.warning(f"Replaced existing entry for invoice {hdr['invoice_number']}.")
-            fn=f.name.replace("'","''")
-            exec_sql(f"INSERT INTO {SCHEMA}.invoice_register (file_name,volume_path,invoice_type,invoice_number,invoice_date,invoice_month,net_amount_eur,file_size_bytes,uploaded_by,uploaded_at) VALUES ('{fn}','{dest}','{it}','{hdr['invoice_number']}','{idate}','{im}',{na},{len(raw)},'app_user',CURRENT_TIMESTAMP())")
-            st.success(f"{f.name} -> {sub}/ ({it}, {hdr['invoice_number']}, EUR {na:,.2f})")
+        _backfill_register()   # older rows need their month filled in before we can match on it
+        res=[]; nn=[]
+        with st.spinner(f"Saving {len(files)} file(s)..."):
+            for f in files:
+                raw=f.getvalue(); k=hashlib.md5(raw).hexdigest()
+                m_,_e=read_invoice_meta(raw)
+                w_=_detail_check(f.name,m_) if m_ else None
+                if w_: pend[k]=dict(name=f.name,raw=raw,why=w_); continue   # looks like an INVXML -> ask first
+                lv,ms_,num=_upload_one(f.name,raw); res.append((lv,ms_))
+                if num: nn.append(num)
+            _pair_register()
+        st.session_state["upload_last"]=res; st.session_state["upload_new"]=nn
+        st.session_state["upl_key"]=uk+1; st.rerun()   # new uploader key = empty uploader
+    for k,p in list(pend.items()):
+        with st.container(border=True):
+            st.warning(f"**{p['name']}**: did you upload the **INVDETXML** and not the INVXML? {p['why'][0].upper()+p['why'][1:]}. "
+                       "The check needs the INVDETXML (invoice detail) file from the TSO. This file has NOT been saved yet.")
+            c1,c2,_=st.columns([1.4,1.6,5])
+            if c1.button("Proceed with upload",key="pu_"+k):
+                _backfill_register(); lv,ms_,num=_upload_one(p["name"],p["raw"]); _pair_register(); pend.pop(k,None)
+                st.session_state["upload_last"]=[(lv,ms_)]; st.session_state["upload_new"]=[num] if num else []; st.rerun()
+            if c2.button("Cancel and re-upload",key="pc_"+k):
+                pend.pop(k,None); st.session_state["upload_last"]=[("info",f"**Not saved \u2014 {p['name']}**. Upload the INVDETXML instead.")]
+                st.session_state["upload_new"]=[]; st.rerun()
+    if last:
+        with st.container(border=True):
+            ok=sum(1 for l,_ in last if l=="success")
+            if ok: st.success(f"**Upload successful** \u2014 {ok} file(s) saved to the Invoice Register (highlighted in green below).")
+            for l,m in last: st.markdown(("\u2713 " if l=="success" else "\u2717 ")+m)
+            if st.button("Clear message",key="upl_clear"):
+                st.session_state["upload_last"]=[]; st.session_state["upload_new"]=[]; st.rerun()
+    if not st.session_state.get("reg_synced"):  # once per session (plus after uploads): fill old rows + refresh pairing
+        _backfill_register(); _pair_register(); st.session_state["reg_synced"]=True
     st.subheader("Invoice Register")
-    reg=run_sql(f"SELECT invoice_type,invoice_number,invoice_date,invoice_month,net_amount_eur,file_name FROM {SCHEMA}.invoice_register ORDER BY invoice_type,invoice_date")
+    reg=run_sql(f"SELECT file_name,invoice_type,invoice_number,invoice_date,invoice_month,applies_to_month,alloc_settlement_month,paired_invoice_number,"
+                f"document_type,has_backbilling,net_amount_eur,uploaded_by,uploaded_at FROM {SCHEMA}.invoice_register")
     if len(reg)>0:
-        reg=to_num(reg,["net_amount_eur"]); reg,_,_=for_display(reg)
-        st.dataframe(reg,use_container_width=True,hide_index=True)
+        bm_={n:a for n,a,t in zip(reg["invoice_number"],reg["applies_to_month"],reg["invoice_type"]) if t=="Bill"}
+        def _row(x):
+            p=x["paired_invoice_number"]
+            if x["invoice_type"]=="Bill":
+                ap=x["applies_to_month"]
+                pr=("Ready \u00b7 self-bill "+p) if p else ("Ready \u00b7 self-bill missing (Sales H Grid skipped)" if x["alloc_settlement_month"] else "Ready \u00b7 no self-bill needed")
+            else:
+                ap=bm_.get(p) if p else None
+                pr=(("Paired \u00b7 bill "+p) if p else "Waiting for its bill") if x["alloc_settlement_month"] else "Not used by the check (no allocation settlement sales)"
+            nt=[]
+            if x["document_type"] not in (None,"","Invoice"): nt.append(x["document_type"])
+            if str(x["has_backbilling"]).lower()=="true": nt.append("BackBilling lines")
+            lab=_fmt_month(ap) if ap else (f"{_fmt_month(x['invoice_month'])} (invoice date)" if x["invoice_month"] else "")
+            return pd.Series(dict(applies_to=lab,_ap=ap or x["invoice_month"] or "",pairing=pr,notes=", ".join(nt)))
+        reg=pd.concat([reg,reg.apply(_row,axis=1)],axis=1)
+        reg["alloc_settlement_month"]=reg["alloc_settlement_month"].apply(lambda v:_fmt_month(v) if v else "")
+        reg["_ts"]=pd.to_datetime(reg["uploaded_at"],errors="coerce",utc=True)
+        reg=reg.sort_values(["_ts","invoice_type"],ascending=[False,True],na_position="last")  # v1.10.4: most recently uploaded first
+        reg["uploaded_at"]=reg["uploaded_at"].apply(lambda v:_ts_label(v) if v else "")
+        reg=reg[["file_name","invoice_type","invoice_number","applies_to","pairing","alloc_settlement_month","invoice_date","notes",
+                 "net_amount_eur","uploaded_by","uploaded_at"]]
+        hl=reg["invoice_number"].isin(set(newn)).tolist()
+        reg=to_num(reg,["net_amount_eur"]).reset_index(drop=True); reg,_,_=for_display(reg)
+        fm={c:"{:,.2f}" for c in reg.columns if "net" in c.lower()}
+        st.dataframe(reg.style.format(fm,na_rep="").apply(lambda r:["background-color:#c8e6c9"]*len(r) if hl[r.name] else [""]*len(r),axis=1),
+                     use_container_width=True,hide_index=True)
+        st.caption("Newest uploads at the top; green = just uploaded. Applies to = the invoice month the bill is checked as (latest capacity billing month on the bill); "
+                   "a self-bill shows its paired bill's month, or its invoice-date month if it has no bill. "
+                   "Bill and self-bill are paired on the allocation settlement month inside the files.")
     else: st.info("No invoices uploaded yet.")
 
 with t2:
     st.header("Run Invoice Check")
-    bills=run_sql(f"SELECT DISTINCT invoice_month,file_name,volume_path FROM {SCHEMA}.invoice_register WHERE invoice_type='Bill' ORDER BY invoice_month")
+    bills=run_sql(f"SELECT DISTINCT invoice_month,file_name,volume_path,invoice_number,paired_invoice_number,invoice_date FROM {SCHEMA}.invoice_register WHERE invoice_type='Bill' ORDER BY invoice_month,invoice_date")
     if len(bills)==0: st.info("No Bill invoices. Upload first.")
     else:
-        ms=sorted(bills["invoice_month"].unique()); sm=st.selectbox("Invoice month",ms,index=len(ms)-1)
-        br=bills[bills["invoice_month"]==sm].iloc[0]; bp=br["volume_path"]; bf=br["file_name"]
-        st.write(f"**Bill:** {bf}")
+        ms=sorted(bills["invoice_month"].unique()); sm=st.selectbox("Invoice month",ms,index=len(ms)-1,format_func=_fmt_month)
+        bsel=bills[bills["invoice_month"]==sm]
+        if len(bsel)>1:  # v1.10.0: more than one bill for the month (e.g. a correction) -> choose
+            bi=st.selectbox("Bill",list(range(len(bsel))),index=len(bsel)-1,
+                            format_func=lambda i:f"{bsel.iloc[i]['invoice_number']} \u00b7 dated {bsel.iloc[i]['invoice_date']} \u00b7 {bsel.iloc[i]['file_name']}")
+            br=bsel.iloc[bi]
+        else: br=bsel.iloc[0]
+        bp=br["volume_path"]; bf=br["file_name"]
+        st.write(f"**Bill:** {bf} ({br['invoice_number']})")
         # Periods detected from the bill itself (same as v2 notebook)
         P=detect_periods(parse_invoice_all(volume_read(bp)), pd.to_datetime(sm).date())
         st.caption(f"Invoice month (M): {P['inv_m']} | Arrears VF/EiC: {P['ack']} | Alloc settlement: {P['sck'] or 'none on this bill'}")
-        sbs=run_sql(f"SELECT file_name,volume_path FROM {SCHEMA}.invoice_register WHERE invoice_type='Self-Bill' ORDER BY invoice_date")
-        sp=sf=None
-        if P["ss"] is not None and len(sbs)>0:
-            for _,sbr in sbs.iterrows():
-                sbt=volume_read(sbr["volume_path"]); per=get_alloc_period(sbt,"Allocation Settl")
-                if per and per.replace(day=1)==P["ss"].replace(day=1):
-                    sp=sbr["volume_path"]; sf=sbr["file_name"]; break
-        if sp: st.write(f"**Self-Bill:** {sf}")
-        elif P["ss"] is not None: st.warning("No matching self-bill found (sales settlement will be zero).")
+        # v1.10.0: self-bill comes from the pairing saved at upload (allocation settlement month read from the files); override possible
+        sbs=run_sql(f"SELECT file_name,volume_path,invoice_number,alloc_settlement_month FROM {SCHEMA}.invoice_register WHERE invoice_type='Self-Bill' ORDER BY invoice_date")
+        sp=sf=None; di=0
+        so=["None"]+[f"{n} \u00b7 settlement {_fmt_month(a) if a else '?'} \u00b7 {fn}" for n,a,fn in zip(sbs["invoice_number"],sbs["alloc_settlement_month"],sbs["file_name"])]
+        if len(sbs):
+            pn=br.get("paired_invoice_number")
+            hit=[i for i,n in enumerate(sbs["invoice_number"]) if pn and n==pn]
+            if not hit and P["ss"] is not None:
+                hit=[i for i,a in enumerate(sbs["alloc_settlement_month"]) if a and _m1(a)==_m1(P["ss"])]
+            if hit: di=hit[-1]+1
+        ssel=st.selectbox("Self-bill",list(range(len(so))),index=di,format_func=lambda i:so[i],
+                          help="Picked automatically from the register (same allocation settlement month as the bill). Change only if needed.")
+        if ssel>0: sp=sbs.iloc[ssel-1]["volume_path"]; sf=sbs.iloc[ssel-1]["file_name"]
+        if not sp and P["ss"] is not None: st.warning("No self-bill selected for this bill's allocation settlement (sales settlement will be zero).")
         if st.button("Run Check",type="primary"):
             la=st.empty(); logs=[]
             def log(m): logs.append(f"{datetime.utcnow().strftime('%H:%M:%S')} - {m}"); la.text_area("Progress","\n".join(logs),height=200)
@@ -1243,12 +1796,24 @@ with t3:
                     raw_s=ds.copy(); ds,nc,sc=for_display(ds,nc,sc)
                     ev=st.dataframe(styled(ds,nc,sc),use_container_width=True,hide_index=True,
                                     on_select="rerun",selection_mode="single-row",key=f"sel_{title}_s")
-                    st.caption("Select a row to see the detail behind it: raw Endur deals for capacity rows, or every gas day for Energy in Cash, ZTP Trading and Allocation Settlement.")
+                    st.caption("Select for more information.")
                     if ev and ev.selection.rows:
                         r_=raw_s.iloc[ev.selection.rows[0]].to_dict()
-                        di_=_daily_item(r_)
-                        if di_: render_daily_panel(r_,mf,f"dp_{title}")
-                        if (not di_) or di_.startswith("Capacity"): render_endur_panel(r_,f"ep_{title}_s")  # capacity: gas days, then raw Endur
+                        di_=_daily_item(r_); cap_=(not di_) or di_.startswith("Capacity")
+                        if di_ and not cap_:  # v1.12.0: EiC / ZTP Trading / Alloc: gas days + invoice lines + Ask AI
+                            with st.expander("Gas-day breakdown \u25be"): render_daily_panel(r_,mf,f"dp_{title}")
+                            dl_,dm_=_daily_invoice_lines(r_,mf)
+                            with st.expander("Invoice lines \u25be"): render_daily_invoice_panel(r_,dl_,dm_)
+                            _ask_ai_ui(title,mf,src_run,r_,None,dl_,None,di_)
+                        if cap_:  # v1.8.1: capacity detail in collapsible sections
+                            if di_:
+                                with st.expander("Gas-day breakdown \u25be"): render_daily_panel(r_,mf,f"dp_{title}")
+                            with st.expander("Endur deals \u25be"): raw_e_=render_endur_panel(r_,f"ep_{title}_s")
+                            if str(r_.get("line_type") or "").startswith("LTC"):
+                                il_,im_=_invoice_lines(r_,mf)
+                                with st.expander("Invoice lines \u25be"): render_invoice_panel(r_,il_,im_)
+                                rec_=_reconcile(r_,il_,raw_e_,show=False)  # v1.9.1: no on-screen section; the split + per-deal price effect go to Ask AI
+                                _ask_ai_ui(title,mf,src_run,r_,raw_e_,il_,rec_,di_)
                 else: st.info("No data.")
                 # flagged issues are no longer shown on screen (gas-day panel replaces them); kept for the Excel 'Flagged' sheet
                 df=run_sql(fsql)
