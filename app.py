@@ -17,7 +17,7 @@ FLAG_EUR = 1.0  # v1.11.0: flag every difference of 1 EUR or more (capacity, auc
 AI_MODEL = os.environ.get("AI_MODEL", "databricks-claude-sonnet-4-5")  # v1.9.0: Ask AI (called via ai_query on the SQL warehouse)
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.12.0"
+BASE_VERSION = "1.13.0"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -1552,21 +1552,42 @@ def _backfill_register():
         sets=_meta_sql(m) if m else "document_type='Unreadable'"
         exec_sql(f"UPDATE {SCHEMA}.invoice_register SET {sets} WHERE invoice_number={sql_lit(x['invoice_number'])}")
 
+def _minus_months(d, n):
+    d=_m1(d)
+    if d is None: return None
+    y,m=d.year,d.month-n
+    while m<=0: m+=12; y-=1
+    return date(y,m,1)
+
 def _pair_register():
-    """Bill <-> self-bill on the same allocation settlement month (closest invoice date wins). Only writes changes."""
-    r=run_sql(f"SELECT invoice_number,invoice_type,invoice_date,alloc_settlement_month,paired_invoice_number FROM {SCHEMA}.invoice_register")
+    """v1.13.0: bill <-> self-bill pairing, independent of upload order (re-done for every row after every upload).
+    1) same allocation settlement month on both (closest invoice date wins);
+    2) bill without allocation lines: self-bill with the SAME invoice date (Fluxys issues both together);
+    3) otherwise: self-bill whose settlement month = bill month - 3.
+    Self-bills without allocation settlement sales are never paired. Only writes changes."""
+    r=run_sql(f"SELECT invoice_number,invoice_type,invoice_date,applies_to_month,alloc_settlement_month,paired_invoice_number,pair_method FROM {SCHEMA}.invoice_register")
     if len(r)==0: return
-    b=r[r["invoice_type"]=="Bill"]; s=r[r["invoice_type"]=="Self-Bill"]; want={}
-    for _,x in b.iterrows():
-        if not x["alloc_settlement_month"]: continue
-        c=s[s["alloc_settlement_month"]==x["alloc_settlement_month"]].copy()
-        if len(c)==0: continue
-        c["dd"]=(pd.to_datetime(c["invoice_date"])-pd.to_datetime(x["invoice_date"])).abs()
-        sn=c.sort_values("dd").iloc[0]["invoice_number"]
-        want[x["invoice_number"]]=sn; want.setdefault(sn,x["invoice_number"])
+    b=r[r["invoice_type"]=="Bill"]; s=r[(r["invoice_type"]=="Self-Bill")&r["alloc_settlement_month"].notna()]
+    want={}; how={}; used=set()
+    def _take(bn,c,method):
+        c=c[~c["invoice_number"].isin(used)]
+        if len(c)==0: return False
+        bd=pd.to_datetime(b.loc[b["invoice_number"]==bn,"invoice_date"].iloc[0])
+        c=c.assign(dd=(pd.to_datetime(c["invoice_date"])-bd).abs()).sort_values("dd")
+        sn=c.iloc[0]["invoice_number"]; used.add(sn)
+        want[bn]=sn; want[sn]=bn; how[bn]=how[sn]=method; return True
+    for _,x in b.iterrows():   # 1) settlement month on both
+        if x["alloc_settlement_month"]: _take(x["invoice_number"],s[s["alloc_settlement_month"]==x["alloc_settlement_month"]],"same settlement month")
+    for _,x in b.iterrows():   # 2) + 3) bills without allocation lines
+        bn=x["invoice_number"]
+        if bn in want or x["alloc_settlement_month"]: continue
+        if _take(bn,s[s["invoice_date"]==x["invoice_date"]],"same invoice date"): continue
+        m3=_minus_months(x["applies_to_month"],3)
+        if m3: _take(bn,s[s["alloc_settlement_month"].apply(_m1)==m3],"settlement month = bill month - 3")
     for _,x in r.iterrows():
-        w=want.get(x["invoice_number"]); cur=x["paired_invoice_number"] or None
-        if w!=cur: exec_sql(f"UPDATE {SCHEMA}.invoice_register SET paired_invoice_number={sql_lit(w)} WHERE invoice_number={sql_lit(x['invoice_number'])}")
+        n=x["invoice_number"]; w=want.get(n); hw=how.get(n)
+        if w!=(x["paired_invoice_number"] or None) or hw!=(x["pair_method"] or None):
+            exec_sql(f"UPDATE {SCHEMA}.invoice_register SET paired_invoice_number={sql_lit(w)},pair_method={sql_lit(hw)} WHERE invoice_number={sql_lit(n)}")
 
 def _upload_one(fname, raw):
     """Store one uploaded XML. Returns (level, message)."""
@@ -1648,7 +1669,7 @@ with t1:
     if not st.session_state.get("reg_synced"):  # once per session (plus after uploads): fill old rows + refresh pairing
         _backfill_register(); _pair_register(); st.session_state["reg_synced"]=True
     st.subheader("Invoice Register")
-    reg=run_sql(f"SELECT file_name,invoice_type,invoice_number,invoice_date,invoice_month,applies_to_month,alloc_settlement_month,paired_invoice_number,"
+    reg=run_sql(f"SELECT file_name,invoice_type,invoice_number,invoice_date,invoice_month,applies_to_month,alloc_settlement_month,paired_invoice_number,pair_method,"
                 f"document_type,has_backbilling,net_amount_eur,uploaded_by,uploaded_at FROM {SCHEMA}.invoice_register")
     if len(reg)>0:
         bm_={n:a for n,a,t in zip(reg["invoice_number"],reg["applies_to_month"],reg["invoice_type"]) if t=="Bill"}
@@ -1656,10 +1677,12 @@ with t1:
             p=x["paired_invoice_number"]
             if x["invoice_type"]=="Bill":
                 ap=x["applies_to_month"]
-                pr=("Ready \u00b7 self-bill "+p) if p else ("Ready \u00b7 self-bill missing (Sales H Grid skipped)" if x["alloc_settlement_month"] else "Ready \u00b7 no self-bill needed")
+                hw_=f" ({x['pair_method']})" if p and x["pair_method"] else ""
+                pr=("Ready \u00b7 self-bill "+p+hw_) if p else ("Ready \u00b7 self-bill missing (Sales H Grid skipped)" if x["alloc_settlement_month"] else "Ready \u00b7 no self-bill needed")
             else:
                 ap=bm_.get(p) if p else None
-                pr=(("Paired \u00b7 bill "+p) if p else "Waiting for its bill") if x["alloc_settlement_month"] else "Not used by the check (no allocation settlement sales)"
+                hw_=f" ({x['pair_method']})" if p and x["pair_method"] else ""
+                pr=(("Paired \u00b7 bill "+p+hw_) if p else "Waiting for its bill") if x["alloc_settlement_month"] else "Not used by the check (no allocation settlement sales)"
             nt=[]
             if x["document_type"] not in (None,"","Invoice"): nt.append(x["document_type"])
             if str(x["has_backbilling"]).lower()=="true": nt.append("BackBilling lines")
@@ -1711,7 +1734,14 @@ with t2:
             if hit: di=hit[-1]+1
         ssel=st.selectbox("Self-bill",list(range(len(so))),index=di,format_func=lambda i:so[i],
                           help="Picked automatically from the register (same allocation settlement month as the bill). Change only if needed.")
-        if ssel>0: sp=sbs.iloc[ssel-1]["volume_path"]; sf=sbs.iloc[ssel-1]["file_name"]
+        sba=None
+        if ssel>0: sp=sbs.iloc[ssel-1]["volume_path"]; sf=sbs.iloc[ssel-1]["file_name"]; sba=sbs.iloc[ssel-1]["alloc_settlement_month"]
+        def _sb_period(P_):  # v1.13.0: bill without allocation lines -> settlement period from the self-bill, so its sales are still checked
+            if P_["ss"] is None and sba:
+                s_=_m1(sba); P_.update(ss=s_,se=date(s_.year,s_.month,calendar.monthrange(s_.year,s_.month)[1]),sck=f"{s_.year}-{s_.month:02d}",ss_from_sb=True)
+            return P_
+        P=_sb_period(P)
+        if P.get("ss_from_sb"): st.caption(f"Allocation settlement {_fmt_month(P['ss'])} taken from the self-bill (this bill has no allocation purchase lines); the self-bill sales are checked, purchases are zero.")
         if not sp and P["ss"] is not None: st.warning("No self-bill selected for this bill's allocation settlement (sales settlement will be zero).")
         if st.button("Run Check",type="primary"):
             la=st.empty(); logs=[]
@@ -1720,7 +1750,7 @@ with t2:
                 rid=str(uuid.uuid4())[:8]; started=datetime.utcnow()
                 log(f"Reading bill: {bf}"); bb=volume_read(bp); df_all=parse_invoice_all(bb)
                 log(f"Parsed {len(df_all)} entries.")
-                P=detect_periods(df_all, pd.to_datetime(sm).date())
+                P=_sb_period(detect_periods(df_all, pd.to_datetime(sm).date()))
                 inv_m=P["inv_m"]; ckm=str(inv_m)
                 am,aend,ack=P["am"],P["aend"],P["ack"]
                 log(f"Invoice month {inv_m}; arrears {am}..{aend}; settlement {P['ss']}..{P['se']}")
