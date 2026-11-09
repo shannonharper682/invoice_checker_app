@@ -29,7 +29,7 @@ def _flag_level(t):
 AI_MODEL = os.environ.get("AI_MODEL", "databricks-claude-sonnet-4-5")  # v1.9.0: Ask AI (called via ai_query on the SQL warehouse)
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.15.2"
+BASE_VERSION = "1.17.0"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -941,6 +941,71 @@ def describe_flag(f):
     if dp: s+=f" ({dp}%)"
     return s
 
+def select_table(df, style_fn, key, multi=False, help_="Tick to see more information about this row"):
+    """v1.16.1: table with a visible, titled 'Select' tick-box column on the left (replaces st.dataframe row selection,
+    whose tick-box column has no header). Single mode keeps only the most recently ticked row.
+    Returns the selected row positions (0-based, in df order)."""
+    sk,vk,ik=f"{key}__sel",f"{key}__v",f"{key}__init"
+    d=df.reset_index(drop=True).copy()
+    init=[i for i in st.session_state.get(ik,[]) if i<len(d)]
+    d.insert(0,"Select",[i in init for i in range(len(d))])
+    ed=st.data_editor(style_fn(d),key=f"{key}_{st.session_state.get(vk,0)}",hide_index=True,use_container_width=True,
+                      num_rows="fixed",disabled=[c for c in d.columns if c!="Select"],
+                      column_config={"Select":st.column_config.CheckboxColumn("Select",help=help_,default=False,width=62,pinned=False)})  # v1.16.2: narrow, no icon, not pinned
+    now=[i for i,v in enumerate(ed["Select"].tolist()) if v]
+    prev=st.session_state.get(sk,[])
+    if not multi and len(now)>1:   # keep only the newest tick
+        keep=([i for i in now if i not in prev] or now)[-1:]
+        st.session_state[sk]=st.session_state[ik]=keep; st.session_state[vk]=st.session_state.get(vk,0)+1; st.rerun()
+    st.session_state[sk]=now
+    return now
+
+def _st_rank(v):
+    """0 = OK, 1 = notice, 2 = technical, 3 = red (gap / no match / review)."""
+    s=str(v or "")
+    if "TECHNICAL" in s: return 2
+    if "NOTICE" in s: return 1
+    if "OK" in s or "VERIFIED" in s: return 0
+    return 3
+
+def _aggregate_rows(ds, collapse="capacity_type"):
+    """v1.16.0: Results tables show ONE row per billing month + direction + line type + location (+ item), like the
+    PDF invoice: e.g. ZPT Entry 'Firm LongTerm' + 'Firm Season' -> 'Firm Total'. Numbers are summed (percentages
+    dropped), deal numbers merged. Returns (aggregated df, list of component rows per output row) so the
+    drill-down can still show each underlying line."""
+    recs=ds.to_dict("records")
+    if len(ds)==0 or collapse not in ds.columns: return ds,[[r] for r in recs]
+    num=[c for c in ds.columns if pd.api.types.is_numeric_dtype(ds[c])]
+    stc=[c for c in ds.columns if "status" in c.lower() or "verdict" in c.lower()]
+    key=[c for c in ds.columns if c not in num+stc+[collapse,"endur_deal_numbers"]]
+    _k=lambda v: None if v is None or (isinstance(v,float) and pd.isna(v)) else v
+    groups={}
+    for r in recs: groups.setdefault(tuple(_k(r[c]) for c in key),[]).append(r)
+    gap_c=next((c for c in ("gap_eur","eur_diff","diff_eur") if c in ds.columns),None)
+    out=[]; comps=[]
+    for g in groups.values():
+        comps.append(g)
+        if len(g)==1: out.append(g[0]); continue
+        a=dict(g[0])
+        for c in num:
+            vals=[x[c] for x in g if pd.notna(x[c])]
+            a[c]=(sum(vals) if vals else None) if "pct" not in c.lower() else None
+        w={str(x[collapse]).split()[0] for x in g if x[collapse]}
+        a[collapse]=f"{w.pop()} Total" if len(w)==1 else "Total"
+        dl=[d.strip() for x in g for d in str(x.get("endur_deal_numbers") or "").split(",") if d.strip()]
+        if "endur_deal_numbers" in a: a["endur_deal_numbers"]=", ".join(dict.fromkeys(dl)) or None
+        for c in stc:
+            ss=[x[c] for x in g]
+            if len(set(ss))==1: a[c]=ss[0]; continue
+            worst=max(ss,key=_st_rank)
+            if _st_rank(worst)<3: a[c]=worst; continue
+            gap=a.get(gap_c) if gap_c else None
+            if any(str(s).startswith("No ") for s in ss): a[c]=f"{next(s for s in ss if str(s).startswith('No '))} (part of total)"
+            elif gap is not None and abs(gap)>=1: a[c]=f"\u0394 {gap:+,.2f} EUR"
+            else: a[c]="REVIEW \u00b7 lines differ"
+        out.append(a)
+    return pd.DataFrame(out,columns=ds.columns),comps
+
 def _sc(val):
     if val and "TECHNICAL" in str(val): return f"background-color:{FLAG_COLOURS['technical']}"  # v1.14.0
     if val and "NOTICE" in str(val): return f"background-color:{FLAG_COLOURS['notice']}"
@@ -1567,7 +1632,7 @@ def build_results_excel(sections, month_label, daily_df=None):
 # === STREAMLIT UI ===
 st.title("Belgium Invoice Checker" + (" (DEV)" if IS_DEV else ""))
 st.caption(f"Version {APP_VERSION}")
-t1,t2,t3,t5,t4 = st.tabs(["Upload Invoices","Run Check","Results","Overview","Run History"])
+t1,t2,t3,t5,t4,t6 = st.tabs(["Upload Invoices","Run Check","Results","Overview","Run History","Info"])
 
 def _user_email():
     h=st.context.headers
@@ -1777,6 +1842,104 @@ def _upload_one(fname, raw):
     if m["has_backbilling"]: notes.append("contains BackBilling (correction) lines")
     return "success", msg+(" \u2014 "+"; ".join(notes) if notes else ""), num
 
+# v1.17.0: Info tab - how the check works (short; keep in line with BELGIUM_CHECKER_KNOWLEDGE.md)
+INFO_SECTIONS = [
+("1. The process in short", """
+1. **Upload** the Fluxys bill XML (and self-bill XML). The app reads type, invoice number and months from inside the file.
+2. **Pair** each bill with its self-bill (automatic, or by hand on the Upload tab).
+3. **Run Check**: every bill line is matched to Equinor data (Endur deals, dispatch allocations, EEX prices).
+4. **Results**: one table per billing period, with status, EUR gap and drill-down per row.
+"""),
+("2. Data sources", """
+| Source | Used for |
+| --- | --- |
+| Fluxys **bill** XML | All capacity, fixed fees, Energy in Cash, ZTP Trading fee, Allocation Settlement purchases |
+| Fluxys **self-bill** XML | Allocation Settlement **sales** only |
+| **Endur** (deal + profile volume + location) | Capacity bookings: `COMM-CAP-ENTRY/EXIT`, Firm or Interruptible, Validated, Belgian locations |
+| **Dispatch** (preliminary allocation) | Energy in Cash quantities, Allocation Settlement quantities |
+| **Endurast** + shipper mapping | ZTP Trading exit quantities |
+| **EEX** ZTP daily spot index (EGSI) | Energy in Cash and Allocation Settlement prices |
+"""),
+("3. Dates: which month is which", """
+* **Invoice month (M)** = the latest capacity billing month on the bill (not the invoice date).
+* **Capacity M** = capacity with billing month = M. **Capacity M-1** = billing month = the month before.
+* **Season (daily) bookings are billed roughly 10th-to-9th**: the bill dated ~10th carries the daily bookings since
+  the previous bill, so the end of last month lands in **M-1** and the first days of this month in **M**.
+  * The app does not assume fixed dates: it takes the window from the Season gas days on the bill
+    (between the 1st of M-1 and the 1st of M+1). Default if none: 10th of M-1 to 9th of M.
+  * Season gas days outside that window are treated as **corrections** and looked up individually in Endur.
+  * Blind spot: a daily booking after the last gas day on the bill (e.g. the 10th) is not searched, as Fluxys bills it next month.
+* **LongTerm** (yearly / quarterly / monthly) = any Endur deal active in the billing month.
+* **Variable Fees M-3** (Energy in Cash, ZTP Trading): billed ~3 months in arrears; the month = month of the
+  earliest gas day on those lines (e.g. October bill = July gas days).
+* **Allocation Settlement**: month = earliest billing start of those lines; the self-bill is matched on the same month.
+* **Gas day** = 06:00 to 06:00 (CET/CEST).
+"""),
+("4. Bill / self-bill pairing", """
+Tried in this order, independent of upload order:
+1. **Manual** pair (set on the Upload tab) - always kept.
+2. **Same allocation settlement month** in both files.
+3. **Same invoice date**.
+4. Self-bill settlement month = bill month - 3.
+
+Self-bills without allocation settlement sales are never paired automatically (they are not used by the check).
+"""),
+("5. How each item is checked", """
+* **Capacity LongTerm**: bill QTY (net of negative lines) vs Endur **net** kWh/h; bill EUR vs Endur volume x price.
+  Bill formula: QTY x days billed x tariff / 365.
+* **Capacity Season**: per gas day (Gas-day breakdown). Endur = average kWh/h per booked day.
+* Matching key: billing month x direction x location x LongTerm/Season x Firm/Interruptible.
+  Direction comes from the Endur instrument type (Entry/Exit), never the location name.
+* **Results tables** show one row per billing month, direction, location and line type (e.g. Firm LongTerm + Firm Season
+  = Firm Total), as on the PDF. Ticking a total shows each underlying line.
+* **Energy in Cash**: dispatch kWh per gas day x 0.0008 vs bill QTY; price = EEX ZTP index (published the day before).
+  Entry IP = positive flows, Exit IP = negative flows (hub-internal points excluded), Exit Dom = Tessenderlo + Antwerp Jupiter.
+* **ZTP Trading fee**: exit MWh x 2 (entry = exit) x 0.00195 EUR/MWh.
+* **Allocation Settlement**: bill purchases and self-bill sales vs dispatch, priced at the ZTP index.
+* **Fixed fees** (Zee Platform, ZTP Trading fixed fee): shown for completeness, no Endur match expected.
+"""),
+("6. Special cases", """
+* **Back-billing** (`BillingType` = BackBilling): a correction for an earlier month. Checked like normal lines;
+  if numbers match it shows a yellow NOTICE. Gaps here are compared against what changed in that earlier month.
+* **Interruptible**: rarely billed. Matched separately from Firm; a match shows a yellow NOTICE.
+  *Overnominated Interruptible/Backhaul* is an over-nomination **charge**, not a booking - "No Endur Match" is normal.
+* **Auction premium**: separate bill lines with no location; linked to a location through the AUC- contract numbers.
+  The tariff row is set to 0 gap and any Endur price difference shows on the premium row.
+* **Negative QTY lines**: capacity Fluxys moved off a contract (e.g. OCUC converted to an AUC- contract);
+  netted with the matching positive line.
+* **VIP BENE (Exit)**: Fluxys bills the **gross** OCUC holding - secondary sells (PRI_SEC) are **not** netted.
+* **Virtualys (Exit)**: Fluxys bills the **net** after sell-backs - PRI_SEC sell-backs **are** netted (also zero-price ones).
+* **VIP THE-ZTP**: one Endur location holds Entry and Exit deals - always split by direction.
+* **Within-day bookings**: capacity on booked hours only. Single-id PRISMA refs (`PRI-<id>-ENTRY/EXIT`, ZPT / Zeebrugge)
+  have Endur price pro-rated by hours/24 - re-based to a full day. Two-id refs (Virtualys, VIP BENE) are not.
+* **Clock-change days** (last Sunday of March = 23 h, October = 25 h): Fluxys bills per **day**, Endur per **hour**.
+  Endur EUR is put on the per-day basis.
+* **Endur price rounding**: Endur often holds the tariff rounded to 3-4 decimals (EUR/MWh) - gives small gaps
+  proportional to volume. See *Price effect by Endur deal* in the drill-down.
+* **Price units in Endur**: EUR/MWh on OCUC/bilateral deals, EUR/kWh on PRISMA deals.
+* **No EEX price yet** for a gas day: only the quantity is checked (orange TECHNICAL, not an error).
+* **Endur only**: Endur capacity not on the bill is flagged (Entry every month, Exit for the invoice month only).
+  Belgian Endur locations not mapped to a bill location are flagged as UNMAPPED.
+"""),
+("7. Status colours and tolerances", """
+| Colour | Meaning |
+| --- | --- |
+| Green **OK** | Matches (EUR gap < 1 EUR) |
+| Red **Δ / No match / REVIEW** | Numbers do not match, or a line has no counterpart |
+| Orange **TECHNICAL** | Data missing; what could be checked matches |
+| Yellow **NOTICE** | Unusual line (Interruptible, BackBilling), numbers match |
+
+* Gas-day flags are raised above **1 %** (capacity, price, quantity) - small EUR gaps can show without a flag.
+* Allocation Settlement: quantity > 10 kWh or EUR > 1 EUR.
+"""),
+]
+
+with t6:
+    st.header("How the check works")
+    st.caption("Short reference for the Run Check logic. Open a section for details.")
+    for i_,(h_,b_) in enumerate(INFO_SECTIONS):
+        with st.expander(h_,expanded=(i_==0)): st.markdown(b_)
+
 with t1:
     st.header("Upload Invoice XML Files")
     st.caption("Upload the Fluxys bill and self-bill XMLs exactly as downloaded \u2014 any file name, any month. "
@@ -1858,10 +2021,9 @@ with t1:
         hl=reg["invoice_number"].isin(set(newn)).tolist()
         reg=to_num(reg,["net_amount_eur"]).reset_index(drop=True); reg,_,_=for_display(reg)
         fm={c:"{:,.2f}" for c in reg.columns if "net" in c.lower()}
-        ev=st.dataframe(reg.style.format(fm,na_rep="").apply(lambda r:["background-color:#c8e6c9"]*len(r) if hl[r.name] else [""]*len(r),axis=1),
-                        use_container_width=True,hide_index=True,on_select="rerun",selection_mode="multi-row",
-                        key=f"reg_sel_{st.session_state.get('reg_sel_k',0)}")
-        rows_=list(ev.selection.rows) if ev is not None and getattr(ev,"selection",None) else []
+        st.caption("Tick **Select** on one bill and one self-bill to pair or unpair them.")
+        rows_=select_table(reg,lambda d:d.style.format(fm,na_rep="").apply(lambda r:["background-color:#c8e6c9"]*len(r) if hl[r.name] else [""]*len(r),axis=1),
+                           f"reg_sel_{st.session_state.get('reg_sel_k',0)}_{abs(hash(tuple(meta['invoice_number'])))%10**8}",multi=True,help_="Tick one bill and one self-bill to pair / unpair them")
         if rows_: _pair_selection(meta,rows_)
         st.caption("Newest uploads at the top; green = just uploaded. Applies to = the invoice month the bill is checked as (latest capacity billing month on the bill); "
                    "a self-bill shows its paired bill's month, or its invoice-date month if it has no bill. "
@@ -1988,12 +2150,33 @@ with t3:
                 if len(ds)>0:
                     nc=[c for c in ds.columns if any(k in c.lower() for k in ["eur","kwh","volume","diff","pct","gap"])]
                     ds=to_num(ds,nc); sc=[c for c in ds.columns if "status" in c.lower() or "verdict" in c.lower()]
+                    ds,comps=_aggregate_rows(ds)  # v1.16.0: PDF-style totals (capacity tables; other tables have no capacity_type and stay as they are)
                     raw_s=ds.copy(); ds,nc,sc=for_display(ds,nc,sc)
-                    ev=st.dataframe(styled(ds,nc,sc),use_container_width=True,hide_index=True,
-                                    on_select="rerun",selection_mode="single-row",key=f"sel_{title}_s")
-                    st.caption("Select for more information.")
-                    if ev and ev.selection.rows:
-                        r_=raw_s.iloc[ev.selection.rows[0]].to_dict()
+                    st.caption("Tick **Select** on a row to see its gas days, Endur deals, invoice lines and Ask AI below the table.")
+                    sel_=select_table(ds,lambda d,nc=nc,sc=sc:styled(d,nc,sc),f"sel_{title}_{abs(hash((mf,src_run,len(ds))))%10**8}")  # new key per month/run
+                    if "capacity_type" in raw_s.columns:
+                        st.caption("One row per billing month, direction, location and line type, as on the PDF invoice "
+                                   "(e.g. Firm LongTerm + Firm Season = Firm Total).")
+                    if sel_:
+                        parts=comps[sel_[0]]
+                        if len(parts)>1:
+                            st.info("This total is made of "+str(len(parts))+" lines: "+", ".join(
+                                f"{p.get('capacity_type') or p.get('item')} ({(p.get('invoice_eur') or 0):,.2f} EUR, {p.get('status') or p.get('verdict')})" for p in parts)
+                                +". Details per line below.")
+                        for pi_,r_ in enumerate(parts):
+                            if len(parts)>1: st.markdown(f"#### {r_.get('capacity_type') or r_.get('item')}")
+                            _detail(r_, title if pi_==0 else f"{title}_{pi_}")
+                else: st.info("No data.")
+                # flagged issues are no longer shown on screen (gas-day panel replaces them); kept for the Excel 'Flagged' sheet
+                df=run_sql(fsql)
+                if len(df)>0:
+                    nc=[c for c in df.columns if any(k in c.lower() for k in ["eur","kwh","volume","diff","pct","gap"])]
+                    df=to_num(df,nc); df,nc,_=for_display(df,nc)
+                sections.append((title,caption,ds,ft,df))
+            def _detail(r_, title):
+                """Drill-down for one underlying summary line (unchanged from v1.12 - v1.15)."""
+                if True:
+                    if True:
                         di_=_daily_item(r_); cap_=(not di_) or di_.startswith("Capacity")
                         if di_ and not cap_:  # v1.12.0: EiC / ZTP Trading / Alloc: gas days + invoice lines + Ask AI
                             with st.expander("Gas-day breakdown \u25be"): render_daily_panel(r_,mf,f"dp_{title}")
@@ -2009,13 +2192,6 @@ with t3:
                                 with st.expander("Invoice lines \u25be"): render_invoice_panel(r_,il_,im_)
                                 rec_=_reconcile(r_,il_,raw_e_,show=False)  # v1.9.1: no on-screen section; the split + per-deal price effect go to Ask AI
                                 _ask_ai_ui(title,mf,src_run,r_,raw_e_,il_,rec_,di_)
-                else: st.info("No data.")
-                # flagged issues are no longer shown on screen (gas-day panel replaces them); kept for the Excel 'Flagged' sheet
-                df=run_sql(fsql)
-                if len(df)>0:
-                    nc=[c for c in df.columns if any(k in c.lower() for k in ["eur","kwh","volume","diff","pct","gap"])]
-                    df=to_num(df,nc); df,nc,_=for_display(df,nc)
-                sections.append((title,caption,ds,ft,df))
             show("Capacity M","Capacity bookings where the billing month equals the invoice month.",
                 f"SELECT endur_deal_numbers,billing_month,direction,type AS line_type,location,product_name AS capacity_type,invoice_eur,equinor_eur,invoice_volume AS invoice_kwh_h,equinor_volume AS endur_kwh_h,diff_eur AS gap_eur,status FROM {S('be_m','M')} ORDER BY direction,location",
                 f"SELECT {FSEL('invoice_kwh_h','endur_kwh_h','gap_eur','gap_pct')} FROM {F('be_m_flagged','M')} ORDER BY gas_day",
