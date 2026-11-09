@@ -31,6 +31,14 @@ Edit it freely: add new findings to "Known cases" so the AI learns from them.
   contract AUC-...). A matching positive line usually appears on the receiving contract.
 * `BillingType` is normally "Billing". "BackBilling" = a correction for an earlier month; it will not match
   the normal monthly amount and should be compared against what changed in that earlier month.
+* **How to recognise back-billing (do not rely on `BillingType` alone):** capacity tariffs are normally billed
+  LongTerm for the invoice month (M) and Season (daily) for M and M-1. A capacity line whose billing month is
+  older than that (LongTerm for M-1 or earlier, Season for M-2 or earlier, e.g. February lines on the May bill)
+  is back-billing, even when the XML says `BillingType` = "Billing". Example May 2026 bill: Feb 2026 Season
+  Entry, Zeebrugge -2,787.03 EUR (BackBilling, SRV-IMPLICIT-404737, "Firm - Implicit Capacity Allocation") and
+  ZPT +2,787.05 EUR (marked "Billing", SRV-410830): the same capacity moved from Zeebrugge to ZPT, net ~0.
+  The checker compares these against the full month of Endur bookings, so large gaps / No Endur Match are
+  expected and are NOT invoice errors; judge them by the positive and negative lines netting off.
 
 ## 3. Endur price and volume conventions
 
@@ -155,7 +163,9 @@ These are billed about 3 months in arrears (e.g. the August bill carries May gas
   explained by the 23 h gas day 28 Mar 2026 (Endur 23 h vs Fluxys full day); removed by the per-day basis (v1.13.3).
 * October 2026 bill: ZPT LongTerm Entry +23,450.89 EUR (2.24 %); after the DST per-day basis still about +22,011 EUR
   (2.10 %) with equal capacity -> a price/tariff difference, not DST. VIP BENE Exit capacity 1,525,800 (Endur) vs
-  1,025,800 (bill) -> an extra 500,000 kWh/h in Endur.
+  1,025,800 (bill) -> an extra 500,000 kWh/h in Endur = deal 5722845 PRI_SEC_100725782_EXIT, a secondary buy from
+  Engie (transfer of use, not billed by Fluxys). Since v1.18.0 only deals with Fluxys as counterparty are compared,
+  so it is left out (shown under 'Not included' in the Endur drill-down).
 * Within-day price pro-rating (see section 3) previously doubled Virtualys Apr 2026 Season EUR; fixed.
 
 ## 7. Typical causes to consider
@@ -165,7 +175,8 @@ These are billed about 3 months in arrears (e.g. the August bill carries May gas
 * Missing or extra deal in Endur (capacity gap), deal not Validated, deal booked on the wrong location or
   direction, wrong Firm/Interruptible service type.
 * Secondary trades netted where Fluxys bills gross (VIP BENE), or not netted where Fluxys bills net (Virtualys).
-* Back-billing / corrections (`BillingType` BackBilling, or lines in M-1) not matching the normal month.
+* Back-billing / corrections (`BillingType` BackBilling, or capacity lines older than M for LongTerm / M-1
+  for Season) not matching the normal month - the checker does not reconcile these against Endur yet.
 * Clock-change months (March/October): Fluxys bills per day, Endur per hour.
 * Within-day bookings: hours and pro-rated prices.
 * Auction premium rows mixing tariff and premium.

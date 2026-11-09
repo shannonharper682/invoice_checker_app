@@ -29,7 +29,7 @@ def _flag_level(t):
 AI_MODEL = os.environ.get("AI_MODEL", "databricks-claude-sonnet-4-5")  # v1.9.0: Ask AI (called via ai_query on the SQL warehouse)
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.18.3"
+BASE_VERSION = "1.18.7"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -1010,7 +1010,10 @@ def _aggregate_rows(ds, collapse="capacity_type"):
     key=[c for c in ds.columns if c not in num+stc+[collapse,"endur_deal_numbers"]]
     _k=lambda v: None if v is None or (isinstance(v,float) and pd.isna(v)) else v
     groups={}
-    for r in recs: groups.setdefault(tuple(_k(r[c]) for c in key),[]).append(r)
+    # v1.18.7: Firm and Interruptible are never combined (first word of the capacity type is part of the key);
+    # Firm LongTerm + Firm Season (etc.) still become one 'Firm Total' row.
+    _cls=lambda v: str(v).split()[0] if v is not None and str(v).strip() else None
+    for r in recs: groups.setdefault(tuple(_k(r[c]) for c in key)+(_cls(r[collapse]),),[]).append(r)
     gap_c=next((c for c in ("gap_eur","eur_diff","diff_eur") if c in ds.columns),None)
     out=[]; comps=[]
     for g in groups.values():
@@ -1020,6 +1023,11 @@ def _aggregate_rows(ds, collapse="capacity_type"):
         for c in num:
             vals=[x[c] for x in g if pd.notna(x[c])]
             a[c]=(sum(vals) if vals else None) if "pct" not in c.lower() else None
+        # v1.18.6: total gap = total Equinor EUR - total invoice EUR (a line with no Endur match counts as 0 EUR on the
+        # Equinor side). Before, the missing gap was skipped, so e.g. Virtualys Apr 2026 showed 0 instead of -1,539.49.
+        if gap_c and "invoice_eur" in a and "equinor_eur" in a:
+            _z=lambda v: 0.0 if v is None or pd.isna(v) else float(v)
+            a[gap_c]=round(sum(_z(x["equinor_eur"]) for x in g)-sum(_z(x["invoice_eur"]) for x in g),2)
         w={str(x[collapse]).split()[0] for x in g if x[collapse]}
         a[collapse]=f"{w.pop()} Total" if len(w)==1 else "Total"
         dl=[d.strip() for x in g for d in str(x.get("endur_deal_numbers") or "").split(",") if d.strip()]
@@ -1030,7 +1038,8 @@ def _aggregate_rows(ds, collapse="capacity_type"):
             worst=max(ss,key=_st_rank)
             if _st_rank(worst)<3: a[c]=worst; continue
             gap=a.get(gap_c) if gap_c else None
-            if any(str(s).startswith("No ") for s in ss): a[c]=f"{next(s for s in ss if str(s).startswith('No '))} (part of total)"
+            if any(str(s).startswith("No ") for s in ss):
+                a[c]=f"{next(s for s in ss if str(s).startswith('No '))} (part of total)"+(f" \u00b7 \u0394 {gap:+,.2f} EUR" if gap is not None and abs(gap)>=1 else "")
             elif gap is not None and abs(gap)>=1: a[c]=f"\u0394 {gap:+,.2f} EUR"
             else: a[c]="REVIEW \u00b7 lines differ"
         out.append(a)
@@ -1349,7 +1358,7 @@ def _ask_ai_ui(title, mf, src_run, r_, raw_e_, il_, rec_, di_):
             dly_=run_sql(f"SELECT gas_day,flag,invoice_volume,invoice_price,invoice_eur,equinor_volume,equinor_price,equinor_eur,diff_volume,diff_eur,detail FROM {SCHEMA}.be_daily "
                          f"WHERE check_month IN ({mf}) AND item={sql_lit(di_)} AND billing_month={sql_lit(str(r_.get('billing_month')))} ORDER BY gas_day")
         with st.spinner("Asking AI (10-30 seconds)..."):
-            try: st.session_state[ak_]=ask_ai(r_,raw_e_,il_,rec_ or None,dly_)
+            try: st.session_state[ak_]=ask_ai(r_,raw_e_,il_,rec_ or None,dly_,check_month=str(mf).split(",")[0].strip("' "))
             except Exception as e: st.session_state[ak_]=f"AI call failed: {e}"
     if st.session_state.get(ak_):
         with st.expander("AI explanation \u25be",expanded=True):
@@ -1534,7 +1543,28 @@ def _csv(df,cols=None,n=250):
     extra=f"\n... {len(d)-n} more rows not shown" if len(d)>n else ""
     return d.head(n).to_csv(index=False)+extra
 
-def ask_ai(row, raw_e, il, rec, daily):
+def _backbilling_info(row, check_month, il=None):
+    """v1.18.5: back-billing test for a capacity row. Capacity is normally billed LongTerm for M and Season for M / M-1;
+    an older billing month = back-billing (correction), even if the XML BillingType says 'Billing'. Returns dict or None."""
+    if not str(row.get("line_type") or "").startswith("LTC"): return None
+    try:
+        cm=pd.to_datetime(str(check_month).strip("' ")[:10]).date().replace(day=1)
+        bm=pd.to_datetime(str(row.get("billing_month"))[:10]).date().replace(day=1)
+    except Exception: return None
+    lag=(cm.year-bm.year)*12+cm.month-bm.month
+    season="Season" in str(row.get("capacity_type") or "")
+    normal=1 if season else 0
+    xml_bb=0
+    if il is not None and len(il)>0 and "billing_type" in il.columns:
+        xml_bb=int(il["billing_type"].astype(str).str.contains("back",case=False).sum())
+    is_bb=lag>normal or xml_bb>0
+    return dict(is_backbilling=bool(is_bb),invoice_month=str(cm),billing_month=str(bm),months_back=lag,
+                normally_billed_up_to=f"M-{normal}" if normal else "M",xml_backbilling_lines=xml_bb,
+                reason=(f"billing month is {lag} month(s) before the invoice month; {'Season' if season else 'LongTerm'} capacity is normally billed "
+                        f"{'in M or M-1' if season else 'in M only'}" if lag>normal else "")+
+                       (f"{'; ' if lag>normal else ''}{xml_bb} invoice line(s) with BillingType=BackBilling" if xml_bb else ""))
+
+def ask_ai(row, raw_e, il, rec, daily, check_month=None):
     keep=["billing_month","direction","location","line_type","item","capacity_type","invoice_kwh_h","endur_kwh_h","invoice_eur","equinor_eur",
           "gap_eur","eur_diff","qty_diff_pct","status","verdict","endur_deal_numbers"]
     rj={k:(None if (isinstance(row.get(k),float) and pd.isna(row.get(k))) else row.get(k)) for k in keep if k in row}
@@ -1555,6 +1585,9 @@ do not invent data; if the data cannot explain the gap, say so and say what to l
 RECONCILIATION.gap_by_deal is exact arithmetic (signed MWh x (Endur EUR/MWh - bill tariff EUR/MWh)) and sums to the price effect;
 use it rather than doing your own arithmetic. is_bill_tariff_rounded=true means the Endur price is the bill tariff rounded to
 price_decimals decimals. The "Known cases" in the knowledge base can be out of date: if this row's data disagrees, trust the data and say so.
+BACK-BILLING: if BACK-BILLING CHECK says is_backbilling=true, start the Likely cause with "Back-billing (correction of <billing month>)"
+and explain it: Endur holds the normal bookings, not the correction, so the Endur comparison is not like-for-like and a large gap or
+"No Endur Match" is expected; look for positive and negative invoice lines (other points/contracts in the same billing month) that net off.
 Answer in markdown, max about 200 words, with exactly these parts:
 **Likely cause:** one or two sentences.
 **Evidence:** 2-5 bullets.
@@ -1566,6 +1599,9 @@ Answer in markdown, max about 200 words, with exactly these parts:
 
 === ROW (Results table, amounts in EUR, capacity in kWh/h) ===
 {json.dumps(rj,default=str)}
+
+=== BACK-BILLING CHECK ===
+{json.dumps(_backbilling_info(row,check_month,il),default=str) if check_month else "(invoice month unknown)"}
 
 === RECONCILIATION (LongTerm only; volume effect + price effect = gap) ===
 {json.dumps(rec,default=str) if rec else "(not applicable for this row)"}
@@ -2179,7 +2215,7 @@ with t3:
     else:
         fmt=_fmt_month
         mm={fmt(m):m for m in am}
-        sl=st.multiselect("Invoice Month",list(mm.keys()),default=[list(mm.keys())[0]])
+        sl=[st.selectbox("Invoice Month",list(mm.keys()),index=0,key="res_month")]  # v1.18.4: one month at a time (was multiselect)
         sms=[mm[l] for l in sl]
         if not sms: st.warning("Select at least one month.")
         else:
@@ -2248,6 +2284,10 @@ with t3:
                 if True:
                     if True:
                         di_=_daily_item(r_); cap_=(not di_) or di_.startswith("Capacity")
+                        bb_=_backbilling_info(r_,str(mf).split(",")[0])  # v1.18.5
+                        if bb_ and bb_["is_backbilling"]:
+                            st.warning(f"Back-billing: correction of {_fmt_month(bb_['billing_month'])} ({bb_['reason']}). "
+                                       "Endur holds the normal bookings, not the correction, so this comparison is not like-for-like.")
                         if di_ and not cap_:  # v1.12.0: EiC / ZTP Trading / Alloc: gas days + invoice lines + Ask AI
                             with st.expander("Gas-day breakdown \u25be"): render_daily_panel(r_,mf,f"dp_{title}")
                             dl_,dm_=_daily_invoice_lines(r_,mf)
