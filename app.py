@@ -29,7 +29,7 @@ def _flag_level(t):
 AI_MODEL = os.environ.get("AI_MODEL", "databricks-claude-sonnet-4-5")  # v1.9.0: Ask AI (called via ai_query on the SQL warehouse)
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.17.0"
+BASE_VERSION = "1.18.3"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -61,6 +61,10 @@ LOCATION_MAP = {
 # Timing rule for the Endur-only check (unchanged from the old route list, where every Entry route was
 # 'seasonal' and every Exit route 'longterm'): Exit is only checked for the invoice month; Entry for every
 # billing month on the bill.
+# v1.18.0: only capacity with Fluxys as counterparty (external legal entity) is billed by Fluxys. Secondary trades with
+# another shipper (transfer of use, e.g. PRI_SEC buy from Engie at VIP BENE) are settled with that shipper and left out.
+# Assignments are booked against Fluxys in Endur (e.g. 'Assignment sell Engie GY21-25'), so they stay in.
+FLUXYS_LE_ID = 20504   # party_v2latest: SA FLUXYS BELGIUM (legal entity); BU = 20503 FLUXYS SA - BU
 def _endur_only_checked(direction, bm, inv_month): return direction=="Entry" or bm==inv_month
 _LTC_VALID = (
     "Entry at Interconnection Point (Firm)","Exit at Interconnection Point (Firm)",
@@ -376,7 +380,8 @@ def check_ltc(df_all, inv_month, log):
         JOIN ms_atlas.endur_standard.profilevolume_v2latest pv2 ON d2.deal_number=pv2.deal_number
         WHERE d2.instrument_type_name IN ('COMM-CAP-EXIT','COMM-CAP-ENTRY') AND d2.buy_sell_name='Sell'
         AND d2.service_type IN ('Firm','Interruptible') AND d2.tran_status='Validated'
-        AND pv2.settlement_type_id=1 AND pv2.price>0 AND LOWER(d2.reference) NOT LIKE '%conversion%'),
+        AND pv2.settlement_type_id=1 AND pv2.price>0 AND LOWER(d2.reference) NOT LIKE '%conversion%'
+        AND pv2.external_le_id={FLUXYS_LE_ID}),
     raw AS (SELECT d.deal_number,d.reference,d.service_type AS ect,
         CASE WHEN d.instrument_type_name='COMM-CAP-ENTRY' THEN 'Entry' ELSE 'Exit' END AS direction,
         l.location_name,l.ng_location_id,CAST(DATE_TRUNC('month',pv.start_date) AS DATE) AS billing_month,
@@ -396,6 +401,7 @@ def check_ltc(df_all, inv_month, log):
         AND d.service_type IN ('Firm','Interruptible') AND d.tran_status='Validated' AND pv.settlement_type_id=1
         AND (pv.price!=0 OR (d.reference LIKE 'PRI_SEC_%' AND d.buy_sell_name='Sell'
              AND pv.location_id IN (SELECT location_id FROM nb)))
+        AND pv.external_le_id={FLUXYS_LE_ID}
         AND cm.country_code='BE' AND pv.start_date>='{ss}' AND pv.end_date<='{m_end}')
     SELECT * FROM raw WHERE rn=1"""
     de = run_sql(esql)
@@ -941,6 +947,14 @@ def describe_flag(f):
     if dp: s+=f" ({dp}%)"
     return s
 
+def _select_col(help_):
+    """v1.17.1: 'Select' tick-box column that works on old and new Streamlit (the app's installed version has no
+    'pinned' and only named widths) - newer options are only passed when this Streamlit supports them."""
+    import inspect
+    p=inspect.signature(st.column_config.CheckboxColumn).parameters
+    kw=dict(width=62,pinned=False) if "pinned" in p else dict(width="small")
+    return st.column_config.CheckboxColumn("Select",help=help_,default=False,**kw)
+
 def select_table(df, style_fn, key, multi=False, help_="Tick to see more information about this row"):
     """v1.16.1: table with a visible, titled 'Select' tick-box column on the left (replaces st.dataframe row selection,
     whose tick-box column has no header). Single mode keeps only the most recently ticked row.
@@ -951,7 +965,7 @@ def select_table(df, style_fn, key, multi=False, help_="Tick to see more informa
     d.insert(0,"Select",[i in init for i in range(len(d))])
     ed=st.data_editor(style_fn(d),key=f"{key}_{st.session_state.get(vk,0)}",hide_index=True,use_container_width=True,
                       num_rows="fixed",disabled=[c for c in d.columns if c!="Select"],
-                      column_config={"Select":st.column_config.CheckboxColumn("Select",help=help_,default=False,width=62,pinned=False)})  # v1.16.2: narrow, no icon, not pinned
+                      column_config={"Select":_select_col(help_)})
     now=[i for i,v in enumerate(ed["Select"].tolist()) if v]
     prev=st.session_state.get(sk,[])
     if not multi and len(now)>1:   # keep only the newest tick
@@ -959,6 +973,22 @@ def select_table(df, style_fn, key, multi=False, help_="Tick to see more informa
         st.session_state[sk]=st.session_state[ik]=keep; st.session_state[vk]=st.session_state.get(vk,0)+1; st.rerun()
     st.session_state[sk]=now
     return now
+
+def _verdict_to_status(ds):
+    """v1.18.3: VERIFIED / REVIEW REQUIRED (Variable Fees M-3, Self Bill) -> a 'status' like the capacity tables:
+    'OK', 'OK \u00b7 \u0394 -7.28 EUR (within 1 %)' or '\u0394 -564.27 EUR \u00b7 qty -0.13 %'. TECHNICAL / NOTICE texts are kept."""
+    ds=ds.copy()
+    def _one(r):
+        v=str(r.get("verdict") or ""); g=r.get("eur_diff"); q=r.get("qty_diff_pct")
+        g=None if g is None or pd.isna(g) else float(g); q=None if q is None or pd.isna(q) else float(q)
+        if "TECHNICAL" in v or "NOTICE" in v or v.startswith("No "): return v
+        qs=f" \u00b7 qty {q:+.2f} %" if q is not None and abs(q)>=0.005 else ""
+        if v.upper().startswith("VERIFIED") or v=="OK":
+            return "OK" if g is None or abs(g)<1 else f"OK \u00b7 \u0394 {g:+,.2f} EUR (within {FLAG_PCT:.0f} %)"
+        if g is not None: return f"\u0394 {g:+,.2f} EUR"+qs
+        return v or "Unknown"
+    ds["verdict"]=[_one(r) for r in ds.to_dict("records")]
+    return ds.rename(columns={"verdict":"status"})
 
 def _st_rank(v):
     """0 = OK, 1 = notice, 2 = technical, 3 = red (gap / no match / review)."""
@@ -1056,9 +1086,7 @@ def render_run_summary(lr):
     st.subheader("Verification summary")
     st.caption(f"Run {lr['rid']} \u00b7 {_ts_label(lr['ts'])} \u00b7 {lr['bill']}")
     fl=lr["flags"]
-    st.caption(f"Note: issues are flagged when the difference is more than {FLAG_PCT:.0f} % (capacity, price, quantity). "
-               f"The {FLAG_PCT:.0f} % tolerance is deliberate: flagging every difference produced many ~0 % flags (e.g. October 2026). "
-               "Smaller differences are not listed here but are still shown in the Results tables (gap EUR) and the gas-day breakdown.")
+    st.caption(f"Flag tolerance: {FLAG_PCT:.0f} %.")  # v1.18.1: shortened note
     # v1.14.0: red issues / orange technical issues / yellow notices
     lv=[_flag_level(f.get("flag_detail")) for f in fl]
     tec=[f for f,l in zip(fl,lv) if l=="technical"]; ntc=[f for f,l in zip(fl,lv) if l=="notice"]
@@ -1120,17 +1148,19 @@ def render_endur_panel(row, key):
            "d.deal_start_date,d.deal_end_date,d.start_time,d.end_time,d.trade_date,d.para_position,"
            "l.location_name,l.ng_location_id,pv.settlement_type_id,pv.start_date,pv.end_date,pv.price,"
            "pv.calculated_profile_volume_kwh,pv.calculated_profile_volume,pv.calculated_payment,"
-           "pv.unit_id,pv.price_unit_id,pv.volume_type_name "
+           "pv.unit_id,pv.price_unit_id,pv.volume_type_name,el.long_name AS counterparty "
            "FROM ms_atlas.endur_standard.deal_v2latest d "
            "JOIN ms_atlas.endur_standard.profilevolume_v2latest pv ON d.deal_number=pv.deal_number "
            "JOIN ms_atlas.endur_standard.location_v2latest l ON pv.location_id=l.location_id "
+           "LEFT JOIN ms_atlas.endur_standard.party_v2latest el ON pv.external_le_id=el.party_id "
            f"WHERE {where}{per} ORDER BY d.deal_number,pv.start_date,pv.settlement_type_id,pv.price LIMIT 5000")
         with st.spinner("Querying Endur..."):
             raw=run_sql(q)
         if len(raw)==0:
-            st.warning("No Endur rows found for this selection."); return
+            st.warning("No Endur rows found for this selection.")
+            _render_excluded_secondary(loc,dirn,ms,me); return
         raw=to_num(raw,["para_position","price","calculated_profile_volume_kwh","calculated_profile_volume","calculated_payment"])
-        hc=["deal_number","reference","instrument_type_name","service_type","buy_sell_name","tran_status","deal_start_date","deal_end_date","start_time","end_time","trade_date","para_position"]
+        hc=["deal_number","reference","counterparty","instrument_type_name","service_type","buy_sell_name","tran_status","deal_start_date","deal_end_date","start_time","end_time","trade_date","para_position"]
         st.markdown("**Deal header** (`deal_v2latest`)")
         st.dataframe(raw[hc].drop_duplicates(),use_container_width=True,hide_index=True)
         pc=["deal_number","location_name","ng_location_id","settlement_type_id","start_date","end_date","price","calculated_profile_volume_kwh","calculated_profile_volume","calculated_payment","unit_id","price_unit_id","volume_type_name"]
@@ -1138,9 +1168,42 @@ def render_endur_panel(row, key):
         st.dataframe(raw[pc],use_container_width=True,hide_index=True)
         st.caption("Raw, unprocessed and live from Endur (as it is now, not as it was at the time of the run). "
                    "All rows are shown, including price = 0 rows and every settlement type; the check itself only uses "
-                   "settlement_type_id = 1 with price \u2260 0 (plus zero-price PRI_SEC sells where applicable).")
+                   "settlement_type_id = 1 with price \u2260 0 (plus zero-price PRI_SEC sells where applicable), "
+                   "and only deals with Fluxys as counterparty.")
         if deals and "LongTerm" in str(row.get("capacity_type") or ""): _endur_calc(raw)
+        _render_excluded_secondary(loc,dirn,ms,me)
         return raw
+
+def _render_excluded_secondary(loc, dirn, ms, me):
+    """v1.18.0: raw Endur rows of capacity deals at this location / direction / month that the check LEAVES OUT because
+    the counterparty is not Fluxys (secondary trade with another shipper = transfer of use, not billed by Fluxys)."""
+    if loc not in LOCATION_MAP or not ms: return
+    it={"Entry":"COMM-CAP-ENTRY","Exit":"COMM-CAP-EXIT"}.get(str(dirn))
+    itf=f"d.instrument_type_name='{it}'" if it else "d.instrument_type_name IN ('COMM-CAP-ENTRY','COMM-CAP-EXIT')"
+    q=("SELECT d.deal_number,d.reference,el.long_name AS counterparty,d.instrument_type_name,d.service_type,d.buy_sell_name,"
+       "d.tran_status,d.deal_start_date,d.deal_end_date,d.execution_venue,d.trade_date,d.para_position,"
+       "l.location_name,l.ng_location_id,pv.settlement_type_id,pv.start_date,pv.end_date,pv.price,"
+       "pv.calculated_profile_volume_kwh,pv.calculated_payment "
+       "FROM ms_atlas.endur_standard.deal_v2latest d "
+       "JOIN ms_atlas.endur_standard.profilevolume_v2latest pv ON d.deal_number=pv.deal_number "
+       "JOIN ms_atlas.endur_standard.location_v2latest l ON pv.location_id=l.location_id "
+       "LEFT JOIN ms_atlas.endur_standard.party_v2latest el ON pv.external_le_id=el.party_id "
+       f"WHERE l.ng_location_id='{LOCATION_MAP[loc]}' AND {itf} AND d.tran_status='Validated' "
+       f"AND d.service_type IN ('Firm','Interruptible') AND COALESCE(pv.external_le_id,-1)<>{FLUXYS_LE_ID} "
+       f"AND pv.start_date<='{me}' AND pv.end_date>='{ms}' "
+       "ORDER BY d.deal_number,pv.start_date,pv.settlement_type_id,pv.price LIMIT 2000")
+    ex=run_sql(q)
+    st.markdown("**Not included in the check \u2014 secondary trades with another shipper**")
+    if len(ex)==0:
+        st.caption(f"None: every {dirn or ''} capacity deal at {loc} this month has Fluxys as counterparty."); return
+    ex=to_num(ex,["para_position","price","calculated_profile_volume_kwh","calculated_payment"])
+    st.caption("Counterparty is another shipper, not Fluxys (transfer of use). These are settled with that shipper and "
+               "are not on the Fluxys bill, so they are left out of the Equinor side. Raw rows, live from Endur.")
+    hc=["deal_number","reference","counterparty","instrument_type_name","service_type","buy_sell_name","tran_status",
+        "deal_start_date","deal_end_date","execution_venue","trade_date","para_position"]
+    st.dataframe(ex[hc].drop_duplicates(),use_container_width=True,hide_index=True)
+    pc=["deal_number","counterparty","location_name","settlement_type_id","start_date","end_date","price","calculated_profile_volume_kwh","calculated_payment"]
+    st.dataframe(ex[pc],use_container_width=True,hide_index=True)
 
 def _period_hours(s,e):
     return sum(_gasday_hours(s+timedelta(days=i)) for i in range((e-s).days+1))
@@ -1907,6 +1970,10 @@ Self-bills without allocation settlement sales are never paired automatically (t
   The tariff row is set to 0 gap and any Endur price difference shows on the premium row.
 * **Negative QTY lines**: capacity Fluxys moved off a contract (e.g. OCUC converted to an AUC- contract);
   netted with the matching positive line.
+* **Counterparty must be Fluxys**: only Endur capacity with SA Fluxys Belgium as counterparty is compared.
+  Secondary trades with another shipper (transfer of use, e.g. PRI_SEC buy from Engie at VIP BENE, Oct 2026) are
+  settled with that shipper, not Fluxys - left out, but listed under *Endur deals* in the drill-down.
+  Assignments are booked against Fluxys in Endur, so they stay in.
 * **VIP BENE (Exit)**: Fluxys bills the **gross** OCUC holding - secondary sells (PRI_SEC) are **not** netted.
 * **Virtualys (Exit)**: Fluxys bills the **net** after sell-backs - PRI_SEC sell-backs **are** netted (also zero-price ones).
 * **VIP THE-ZTP**: one Endur location holds Entry and Exit deals - always split by direction.
@@ -1998,7 +2065,8 @@ with t1:
             if x["invoice_type"]=="Bill":
                 ap=x["applies_to_month"]
                 hw_=f" ({x['pair_method']})" if p and x["pair_method"] else ""
-                pr=("Ready \u00b7 self-bill "+p+hw_) if p else ("Ready \u00b7 self-bill missing (Sales H Grid skipped)" if x["alloc_settlement_month"] else "Ready \u00b7 no self-bill needed")
+                # v1.18.2: say 'Paired' on the bill too (was 'Ready', unclear whether pairing worked)
+                pr=("Paired \u00b7 self-bill "+p+hw_) if p else ("Not paired \u00b7 self-bill missing (Sales H Grid skipped)" if x["alloc_settlement_month"] else "Not paired \u00b7 no self-bill needed")
             else:
                 ap=bm_.get(p) if p else None
                 hw_=f" ({x['pair_method']})" if p and x["pair_method"] else ""
@@ -2149,7 +2217,9 @@ with t3:
                 ds=run_sql(ssql)
                 if len(ds)>0:
                     nc=[c for c in ds.columns if any(k in c.lower() for k in ["eur","kwh","volume","diff","pct","gap"])]
-                    ds=to_num(ds,nc); sc=[c for c in ds.columns if "status" in c.lower() or "verdict" in c.lower()]
+                    ds=to_num(ds,nc)
+                    if "verdict" in ds.columns: ds=_verdict_to_status(ds)  # v1.18.3: M-3 / Self Bill show the gap like Capacity M
+                    sc=[c for c in ds.columns if "status" in c.lower() or "verdict" in c.lower()]
                     ds,comps=_aggregate_rows(ds)  # v1.16.0: PDF-style totals (capacity tables; other tables have no capacity_type and stay as they are)
                     raw_s=ds.copy(); ds,nc,sc=for_display(ds,nc,sc)
                     st.caption("Tick **Select** on a row to see its gas days, Endur deals, invoice lines and Ask AI below the table.")
