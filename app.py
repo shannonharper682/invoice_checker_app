@@ -29,7 +29,7 @@ def _flag_level(t):
 AI_MODEL = os.environ.get("AI_MODEL", "databricks-claude-sonnet-4-5")  # v1.9.0: Ask AI (called via ai_query on the SQL warehouse)
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.15.1"
+BASE_VERSION = "1.15.2"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
@@ -1712,14 +1712,11 @@ def _unpair_box(bn, sn):
 
 def _pair_selection(meta, rows):
     """v1.15.0: Pair button for two selected Invoice Register rows (must be one bill + one self-bill).
-    v1.15.1: Unpair button when the selection is (one side of) a manual pair."""
+    v1.15.1: Unpair button when the selection is a manual pair.
+    v1.15.2: buttons only appear once BOTH rows are selected (a single click never shows Pair/Unpair)."""
     _s=lambda v: v if isinstance(v,str) and v else None   # NULL / NaN / "" -> None
     if len(rows)==1:
-        x={k:_s(v) for k,v in meta.iloc[rows[0]].to_dict().items()}
-        if x["pair_method"]=="manual" and x["paired_invoice_number"]:
-            bn,sn=(x["invoice_number"],x["paired_invoice_number"]) if x["invoice_type"]=="Bill" else (x["paired_invoice_number"],x["invoice_number"])
-            _unpair_box(bn,sn)
-        st.caption("Select one more row (a bill and a self-bill) to pair them by hand."); return
+        st.caption("Select one more row (a bill and a self-bill) to pair or unpair them."); return
     if len(rows)>2:
         st.info("Select exactly two rows \u2014 one bill and one self-bill \u2014 to pair them."); return
     a,b_=[{k:_s(v) for k,v in meta.iloc[i].to_dict().items()} for i in rows]
@@ -1870,7 +1867,7 @@ with t1:
                    "a self-bill shows its paired bill's month, or its invoice-date month if it has no bill. "
                    "Bill and self-bill are paired on the allocation settlement month inside the files. "
                    "If the automatic pairing is wrong or missing, tick one bill and one self-bill and click Pair (shown as 'manual'). "
-                   "Tick a manually paired row to Unpair it (it goes back to the automatic pairing).")
+                   "To undo a manual pair, tick both of its rows and click Unpair (they go back to the automatic pairing).")
     else: st.info("No invoices uploaded yet.")
 
 with t2:
