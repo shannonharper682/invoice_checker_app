@@ -48,6 +48,12 @@ Edit it freely: add new findings to "Known cases" so the AI learns from them.
 * Within-day PRISMA deals with a single-id reference `PRI-<id>-ENTRY/EXIT` (ZPT, Zeebrugge) have the price
   pro-rated by booked hours / 24 in Endur; the app re-bases them to a full day. Two-id references
   `PRI-<id>-<id>-...` (Virtualys, VIP BENE) already hold the full tariff - no re-basing.
+* Clock-change days (DST): gas day before the last Sunday of March = 23 h, before the last Sunday of October = 25 h.
+  Fluxys bills capacity per DAY (a 23 h / 25 h day is a full day: QTY x days x UP / 365), Endur values it per HOUR.
+  The checker therefore puts Endur EUR on the Fluxys per-day basis: x (days x 24) / actual hours (v1.13.3).
+  Capacity kWh/h always uses the actual hours. Within-day bookings only gain/lose the hour if they cover
+  02:00-03:00 local. Verified: ZPT / Zeebrugge Season 28 Mar 2026 Endur = exactly 23/24 of the bill;
+  VIP THE-ZTP LongTerm Oct 2026 Endur = bill x 745/744 (+36.32 EUR, 0.134 %).
 * Deal duration classifies Endur deals: >= 360 days Yearly, >= 85 Quarterly, >= 27 Monthly, else Daily.
   Non-Daily deals are compared to LongTerm bill lines, Daily deals to Season bill lines.
 
@@ -103,16 +109,31 @@ These are billed about 3 months in arrears (e.g. the August bill carries May gas
   Equinor side: dispatch `preliminary_allocation` (ms_atlas.dispatchnatgas_standard.hourly_v2latest, country BE,
   contract_type Flow) per gas day x 0.0008 (energy-in-cash share). Entry IP = sum of positive flows, Exit IP = sum of
   negative flows (hub-internal ZBHUBEE/ZBHUBFL and domestic points excluded), Exit Dom = TESSENDERLO + ANTWERP JUPITER.
-  Price = EEX ZTP Day index (published the day before the gas day) / 1000 = EUR/kWh.
-  Flags: quantity gap > 1 % (QTY), price mismatch (PRICE), or a day with >= 1 EUR difference (EUR).
+  Price = EEX ZTP daily spot index EGSI (ms07splitprice eex_v1latest, EEX_NaturalGas_EGSI / 'ZTP,EGSI_D' / Price,
+  published the day before the gas day) / 1000 = EUR/kWh. Same values as the old Eex_EuropeanGasSpotIndex 'ZTP,Day'
+  series, which stopped at publication 2026-07-09 (the app uses EGSI from v1.14.2).
+  Equinor EUR = Equinor kWh x that price. If the EEX table has no price yet for a gas day (it can lag behind the
+  bill, e.g. October 2026 bill: no index after 10 July 2026), the day is NOT a price mismatch: Equinor EUR is valued
+  at the invoice price and only the quantity is checked (detail column says so).
+  Flags: quantity gap > 1 % (QTY) or price mismatch (PRICE, only when an EEX price exists). Smaller gaps are not flagged.
+  Exit Dom connection points on the bill vs dispatch location_id (verified Oct 2026 bill, July 2026, every day
+  within 0.5 kWh): "AIR LIQUIDE ANTWERPEN SITE BASF 2" (code 007134) = dispatch ANTWERP JUPITER;
+  "PP/T-POWER TESSENDERLO" (code 005955) = dispatch TESSENDERLO. They are ALREADY mapped - do not suggest adding
+  them again (it would double count). Dispatch has no separate BASF / Air Liquide location.
   Typical causes: preliminary vs final allocation (dispatch is preliminary), a connection point missing from the
   dispatch mapping, a new end-user/domestic point, a price publication-date shift.
 * **ZTP Trading variable fee** (`InvoiceLineGroup` ZTP Trading, `InvoiceLine` Variable Fee; QTY MWh x 0.00195 EUR/MWh,
   separate Entry and Exit lines per day). Equinor side = exit MWh from the shipper mapping + Endurast AST, x 2
-  (entry = exit). Flags: exit quantity gap > 1 %, or a day with >= 1 EUR difference.
+  (entry = exit). Flags: exit quantity gap > 1 %.
 * **Allocation Settlement** purchases (bill) and sales (self-bill, "SB - Allocation Settlements - Sales") vs dispatch,
   priced at the ZTP index; settlement month is earlier than the bill month. Flags: price mismatch, entry without
-  dispatch or vice versa, qty > 10 kWh, EUR >= 1.
+  dispatch or vice versa, qty > 10 kWh, EUR > 1.
+* Flag levels (v1.14.0): RED issue = numbers do not match; ORANGE "TECHNICAL: ..." = data missing or incomplete,
+  what could be checked matches (e.g. no EEX ZTP price for a gas day -> quantity-only check; EiC verdict
+  "TECHNICAL - no EEX price on N day(s), quantities verified"); YELLOW "NOTICE: ..." = unusual line but numbers
+  match (Interruptible capacity, BackBilling lines). Treat orange/yellow as information, not invoice errors.
+* Flag tolerance: issues are flagged above 1 % (capacity, price, quantity). This is deliberate - flagging every
+  difference raised many ~0 % flags. A row can therefore show a small EUR gap with no flag.
 
 ## 6. Known cases (past findings)
 
@@ -130,8 +151,11 @@ These are billed about 3 months in arrears (e.g. the August bill carries May gas
   -> +1.50 EUR. Total -793.01. Not a wrong tariff.
 * Older finding: OCUC price 0.146 EUR/MWh (~1.28 EUR/kWh/h/year) vs bill 1.327 = ~3.6 % tariff indexation gap
   (Endur tariff not updated for the new tariff year).
-* April 2026 bill, M-1 (March 2026) ZPT Season -281.10 EUR and Zeebrugge -164.55 EUR with matching capacity;
-  not investigated. March has the clock-change gas day (28 Mar = 23 h).
+* April 2026 bill, M-1 (March 2026) ZPT Season -281.10 EUR and Zeebrugge -164.55 EUR with matching capacity:
+  explained by the 23 h gas day 28 Mar 2026 (Endur 23 h vs Fluxys full day); removed by the per-day basis (v1.13.3).
+* October 2026 bill: ZPT LongTerm Entry +23,450.89 EUR (2.24 %); after the DST per-day basis still about +22,011 EUR
+  (2.10 %) with equal capacity -> a price/tariff difference, not DST. VIP BENE Exit capacity 1,525,800 (Endur) vs
+  1,025,800 (bill) -> an extra 500,000 kWh/h in Endur.
 * Within-day price pro-rating (see section 3) previously doubled Virtualys Apr 2026 Season EUR; fixed.
 
 ## 7. Typical causes to consider

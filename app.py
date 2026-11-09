@@ -13,26 +13,41 @@ from databricks.sdk.core import Config
 from databricks.sdk.service.sql import StatementParameterListItem
 
 SCHEMA = "ms_vulcan_gpgtopm_plab.belgium_app_demo_v1"
-FLAG_EUR = 1.0  # v1.11.0: flag every difference of 1 EUR or more (capacity, auction premium, variable fee, energy in cash, allocation)
+FLAG_PCT = 1.0  # v1.13.1: back to the 1 % flag tolerance (the 1 EUR rule of v1.11.0 raised too many ~0 % flags, e.g. October 2026)
+
+# v1.14.0: three flag levels, taken from the flag text:
+#   issue     (red)    - numbers do not match                      e.g. "QTY", "price mismatch [Firm]"
+#   technical (orange) - data missing / incomplete, what CAN be checked matches   "TECHNICAL: ..."
+#   notice    (yellow) - something unusual on the invoice, numbers match            "NOTICE: ..."
+FLAG_COLOURS = {"issue": "#ffcdd2", "technical": "#ffe0b2", "notice": "#fff9c4"}
+def _flag_level(t):
+    t=str(t or "").replace("\u26a0\ufe0f","").strip().upper()
+    if not t: return ""
+    if t.startswith("TECHNICAL"): return "technical"
+    if t.startswith("NOTICE"): return "notice"
+    return "issue"
 AI_MODEL = os.environ.get("AI_MODEL", "databricks-claude-sonnet-4-5")  # v1.9.0: Ask AI (called via ai_query on the SQL warehouse)
 
 # --- Version: bump BASE_VERSION on each release. Dev app (name ends with -dev) shows the "-dev" suffix. ---
-BASE_VERSION = "1.13.0"
+BASE_VERSION = "1.15.1"
 APP_NAME = os.environ.get("DATABRICKS_APP_NAME", "")
 IS_DEV = APP_NAME.endswith("-dev")
 APP_VERSION = BASE_VERSION + ("-dev" if IS_DEV else "")
 VOLUME = "/Volumes/ms_vulcan_gpgtopm_plab/belgium_app_demo_v1/invoices"
 DISPATCH_TABLE = "ms_atlas.dispatchnatgas_standard.hourly_v2latest"
-PRICE_TABLE = "ms_atlas.ms07splitprice_standard.eex_v1r0"
+PRICE_TABLE = "ms_atlas.ms07splitprice_standard.eex_v1latest"  # v1.14.1: was eex_v1r0 (same EEX ZTP Day Index; both end at publication 2026-07-09 as of Nov 2026)
 ENDURAST_TABLE = "ms_atlas.endurast_raw.hourly_v1latest"
 COUNTRY = "BE"
 DOMESTIC_LOCATIONS = ("TESSENDERLO", "ANTWERP JUPITER")
 HUB_INTERNAL_LOCATIONS = ("ZBHUBEE", "ZBHUBFL")
 QTY_MULTIPLIER = 0.0008
 TRADING_FEE_RATE = 0.00195
-PRICE_DATA_PACKAGE = "Eex_EuropeanGasSpotIndex"
-PRICE_KEYS = "ZTP,Day"
-PRICE_COLUMN = "Index"
+# v1.14.2: EEX ZTP daily spot index (EGSI). The old series Eex_EuropeanGasSpotIndex / 'ZTP,Day' / Index stops at
+# publication 2026-07-09; EEX_NaturalGas_EGSI / 'ZTP,EGSI_D' / Price is identical on every overlapping day
+# (Sep 2025 - Jul 2026, 0.0000 difference), continues after July and matches all 31 July 2026 bill prices.
+PRICE_DATA_PACKAGE = "EEX_NaturalGas_EGSI"
+PRICE_KEYS = "ZTP,EGSI_D"
+PRICE_COLUMN = "Price"
 # Invoice location -> Endur ng_location_id. Picks up every Endur name variant of a site
 # (e.g. VIP_BENE_FLX and VIP_BENE_FLX-N-X both = BE.FLX.VIPBENE). Direction is NEVER taken from the
 # location: it comes from the deal's instrument_type_name (COMM-CAP-ENTRY / COMM-CAP-EXIT).
@@ -176,8 +191,9 @@ def parse_invoice_all(xml_bytes):
                 cr = ai.findtext("ContractReference") if ai is not None else None
                 sh_s = int(ai.findtext("ServiceStartGasHour") or 0) if ai is not None else 0
                 sh_e = int(ai.findtext("ServiceEndGasHour") or 0) if ai is not None else 0
-                svc_h = (sh_e - sh_s + 1) if (sh_s > 0 and sh_e > 0) else 24
-                if svc_h <= 0: svc_h += 24
+                full_h = _gasday_hours(gas_day) if gas_day else 24   # v1.13.3: 23 / 25 h on clock-change gas days
+                svc_h = (sh_e - sh_s + 1) if (sh_s > 0 and sh_e > 0) else full_h
+                if svc_h <= 0: svc_h += full_h
                 qe = pfi.find("QTY") if pfi is not None else None
                 ue = pfi.find("UP") if pfi is not None else None
                 qv = float(qe.get("QTY",0)) if qe is not None else None
@@ -186,7 +202,7 @@ def parse_invoice_all(xml_bytes):
                 uu = ue.get("UPUnit","") if ue is not None else None
                 vol = qv * svc_h if qv is not None else 0
                 rows.append(dict(product_name=pname,capacity_type=cap_type,invoice_line_group=lg,
-                    location=ln,detail=dt_,billing_start=billing_start,gas_day=gas_day,
+                    location=ln,detail=dt_,billing_start=billing_start,gas_day=gas_day,billing_type=(il.findtext("BillingType") or "").strip(),
                     direction=direction,service_rate_type=srt,contract_ref=cr,
                     billed_amount=ba,qty=qv,qty_unit=qu,service_hours=svc_h,volume_kwh=vol,up=uv,up_unit=uu))
     return pd.DataFrame(rows)
@@ -255,6 +271,7 @@ def _deal_eur(fr_):
     vol=fr_["vol"].astype(float); pr=fr_["price"].astype(float)
     eur=vol*pr/pr.abs().ge(0.01).map({True:1000.0,False:1.0})
     if "wdf" in fr_: eur=eur*fr_["wdf"].astype(float)  # v1.7.2: within-day deals - Endur price is pro-rated by hours/24
+    if "dsf" in fr_: eur=eur*fr_["dsf"].astype(float)  # v1.13.3: clock-change days - Fluxys bills per day, Endur per hour
     z=pr==0
     if z.any():
         den=vol[~z].sum()
@@ -272,25 +289,37 @@ def _gasday_hours(gd):
     if nd==_last_sunday(nd.year,10): return 25
     return 24
 
+def _wd_hours(sh, eh, full):
+    """v1.13.3: booked hours of a within-day booking sh -> eh (local clock hours) on a gas day with `full` hours.
+    The clock change happens at 02:00 local (20 h after the 06:00 gas-day start): spring 02:00-03:00 does not exist,
+    autumn 02:00-03:00 happens twice. Only bookings that cover 02:00-03:00 gain / lose the hour."""
+    h=(eh-sh)%24 or 24
+    if full!=24:
+        os_=(sh-6)%24; oe=(eh-6)%24 or 24
+        if os_<=20 and oe>=21: h+=full-24
+    return max(h,1)
+
 def _pv_hours(r):
-    """(booked hours, within-day price factor) for one Endur profile row.
+    """(booked hours, within-day price factor, day-basis factor) for one Endur profile row.
     Normal rows: gas-day hours (DST aware) across the row's days. Within-day deals (single-day deal whose
-    start_time != end_time, e.g. 12 -> 6 = 18 h): only the booked hours. Endur pro-rates a within-day deal's
-    price by booked/full-day hours, so the factor (full-day / booked hours) puts it back on the Fluxys tariff basis."""
+    start_time != end_time, e.g. 12 -> 6 = 18 h): only the booked hours.
+    - within-day price factor: Endur pro-rates a single-id PRISMA within-day price as day price x hours/24
+      (checked 159/159), so x 24 / booked hours puts it back on the full-day tariff.
+    - day-basis factor (v1.13.3): Fluxys bills capacity per DAY (QTY x days x UP / 365), Endur values it per HOUR,
+      so on 23 h / 25 h clock-change days Endur EUR is x (days x 24) / actual hours to compare like for like
+      (checked: ZPT / Zeebrugge 28 Mar 2026 = exactly 23/24 of the bill; VIP THE-ZTP Oct 2026 = +1/744)."""
     s,e=r["pv_start"],r["pv_end"]
-    full=sum(_gasday_hours(s+timedelta(days=i)) for i in range((e-s).days+1))
+    nd=(e-s).days+1
+    full=sum(_gasday_hours(s+timedelta(days=i)) for i in range(nd))
     if r.get("ds")==r.get("dend") and s==e and pd.notna(r.get("st_h")) and pd.notna(r.get("en_h")):
         sh,eh=int(r["st_h"]),int(r["en_h"])
         if sh!=eh:
-            h=(eh-sh)%24
-            if full!=24 and (sh>=6 or sh<2): h+=full-24   # clock change at 02:00 falls inside the booking
-            h=max(h,1)
-            # Only single-id PRISMA refs (PRI-<id>-ENTRY/EXIT, e.g. ZPT/Zeebrugge) carry a pro-rated price in Endur
-            # (checked: 159/159 such within-day deals = day price x hours/24). Two-id refs (PRI-<id>-<id>-..., e.g.
-            # Virtualys/VIP BENE) already hold the full per-kWh tariff, so they get no re-basing.
+            h=_wd_hours(sh,eh,full)
+            # Only single-id PRISMA refs (PRI-<id>-ENTRY/EXIT, e.g. ZPT/Zeebrugge) carry a pro-rated price in Endur.
+            # Two-id refs (PRI-<id>-<id>-..., e.g. Virtualys/VIP BENE) already hold the full per-kWh tariff.
             pr_=bool(re.match(r"^PRI-\d+-(ENTRY|EXIT)$",str(r.get("reference") or "")))
-            return float(h),(float(full)/h if pr_ else 1.0)
-    return float(full),1.0
+            return float(h),(24.0/h if pr_ else 1.0),1.0
+    return float(full),1.0,(nd*24.0/full if full else 1.0)
 
 def _cap_daily(il, er):
     """Gas-day breakdown for a Season capacity row: invoice lines vs Endur deals per gas day (kWh/h + EUR)."""
@@ -378,7 +407,9 @@ def check_ltc(df_all, inv_month, log):
     de=to_num(de,["st_h","en_h"])
     # v1.7.2: capacity = volume / booked hours (within-day bookings use their own hours; DST days 23/25 h)
     hw=de.apply(_pv_hours,axis=1)
-    de["hrs"]=[h for h,_ in hw]; de["wdf"]=[f for _,f in hw]
+    de["hrs"]=[h for h,_,_ in hw]; de["wdf"]=[f for _,f,_ in hw]; de["dsf"]=[x for _,_,x in hw]
+    ndst=int((de["dsf"]!=1).sum())
+    if ndst: log(f"Endur: {ndst} profile rows contain a 23 h / 25 h clock-change day - EUR put on the Fluxys per-day basis")
     de["cap_kwh_h"]=de["vol"]/de["hrs"]
     nwd=int((de["wdf"]!=1).sum())
     if nwd: log(f"Endur: {nwd} within-day profile rows (capacity on booked hours, price re-based to full day)")
@@ -391,7 +422,8 @@ def check_ltc(df_all, inv_month, log):
         tariff_eur=("billed_amount","sum"),tqkh=("qty","sum"),tvk=("volume_kwh","sum"),
         nd=("gas_day","nunique"),iup=("up","first"),iuu=("up_unit","first"),
         detail=("detail",lambda x:" | ".join(sorted(set(str(v) for v in x if v)))),
-        contracts=("contract_ref",lambda x:",".join(str(v) for v in x if v)))
+        contracts=("contract_ref",lambda x:",".join(str(v) for v in x if v)),
+        backbill=("billing_type",lambda x:any("back" in str(v).lower() for v in x)))
     cb["ikwh"] = cb["tqkh"]/cb["nd"]
     comp_rows,flags = [],[]
     for _,r in cb.iterrows():
@@ -442,7 +474,7 @@ def check_ltc(df_all, inv_month, log):
             invoice_price=round(ip,9) if ip is not None else None,endur_price=round(ep,9) if ep is not None else None,
             price_gap=round(pgp,9) if pgp is not None else None,
             price_gap_pct=round(pgpp,3) if pgpp is not None else None,contracts=r["contracts"],endur_deal_numbers=dn,
-            service_rate_type_=rt,daily=daily))
+            service_rate_type_=rt,daily=daily,backbill=bool(r.get("backbill"))))
         if aeur>0:
             bte=None
             if ip: bte=r["ikwh"]*ip*dim/365 if rt=="LongTerm" else r["tvk"]*ip
@@ -458,31 +490,37 @@ def check_ltc(df_all, inv_month, log):
     for _,r in pd.DataFrame(comp_rows).iterrows():
         bms,d,loc,lt=r["billing_month"],r["direction"],r["location"],r["line_type"]
         ct=r.get("capacity_type","Firm")
+        nf0=len(flags)
         if lt=="Tariff":
             if r["endur_kwh_h"] is None or pd.isna(r.get("endur_kwh_h")):
                 flags.append(dict(type=r["service_rate_type"],gas_day=bms,direction=d,location=loc,
                     invoice_value=r["invoice_kwh_h"],endur_value=None,gap=None,gap_pct=None,
                     unit="kWh/h",note=f"NO ENDUR MATCH [{ct}]",**_lx(r)))
             else:
-                cf=False
                 if r["endur_kwh_h"]!=r["invoice_kwh_h"]:
                     g=r["endur_kwh_h"]-r["invoice_kwh_h"]
                     gp=round(g/r["invoice_kwh_h"]*100,3) if r["invoice_kwh_h"] else None
-                    if abs(g)>0.5:  # v1.11.0: any capacity difference (was > 1 %)
+                    if gp is not None and abs(gp)>FLAG_PCT:
                         flags.append(dict(type=r["service_rate_type"],gas_day=bms,direction=d,location=loc,
                             invoice_value=r["invoice_kwh_h"],endur_value=r["endur_kwh_h"],
-                            gap=g,gap_pct=gp,unit="kWh/h",note=f"capacity rate mismatch [{ct}]",**_lx(r))); cf=True
-                ge=r.get("gap_eur")
-                if not cf and ge is not None and not pd.isna(ge) and abs(ge)>=FLAG_EUR:  # v1.11.0: any EUR difference >= 1 EUR (was price gap > 1 %)
-                    pg=r.get("price_gap_pct")
+                            gap=g,gap_pct=gp,unit="kWh/h",note=f"capacity rate mismatch [{ct}]",**_lx(r)))
+                if r.get("price_gap_pct") is not None and not pd.isna(r.get("price_gap_pct")) and abs(r["price_gap_pct"])>FLAG_PCT:
                     flags.append(dict(type=r["service_rate_type"],gas_day=bms,direction=d,location=loc,
-                        invoice_value=r.get("invoice_eur"),endur_value=r.get("equinor_eur"),gap=ge,
-                        gap_pct=round(ge/r["invoice_eur"]*100,3) if r.get("invoice_eur") else None,unit="EUR",
-                        note=f"EUR difference [{ct}]"+(f" (price gap {pg:+.3f}%)" if pg is not None and not pd.isna(pg) else ""),**_lx(r)))
+                        invoice_value=r.get("invoice_price"),endur_value=r.get("endur_price"),gap=r.get("price_gap"),gap_pct=r["price_gap_pct"],
+                        unit="EUR/unit",note=f"price mismatch [{ct}]",**_lx(r)))
+            # v1.14.0: yellow notice - unusual line, but the numbers match (no red flag raised for this row)
+            if len(flags)==nf0:
+                why=[]
+                if ct=="Interruptible": why.append("Interruptible capacity (rarely billed - check it is expected)")
+                if r.get("backbill"): why.append("BackBilling line(s) - correction of an earlier month")
+                if why:
+                    flags.append(dict(type=r["service_rate_type"],gas_day=bms,direction=d,location=loc,
+                        invoice_value=r["invoice_kwh_h"],endur_value=r.get("endur_kwh_h"),gap=None,gap_pct=None,unit="kWh/h",
+                        note="NOTICE: "+"; ".join(why)+" - numbers match",**_lx(r)))
         elif lt=="Auction Premium":
             if r.get("gap_eur") is not None and not pd.isna(r.get("gap_eur")) and r["invoice_eur"]:
                 gp=round(r["gap_eur"]/r["invoice_eur"]*100,3)
-                if abs(r["gap_eur"])>=FLAG_EUR:  # v1.11.0: was > 1 %
+                if abs(gp)>FLAG_PCT:
                     flags.append(dict(type="AuctionPremium",gas_day=bms,direction=d,location=loc,
                         invoice_value=r["invoice_eur"],endur_value=r["equinor_eur"],gap=r["gap_eur"],gap_pct=gp,
                         unit="EUR",note=f"auction premium EUR mismatch [{ct}]",**_lx(r,vol=False)))
@@ -566,7 +604,7 @@ def check_alloc(bill_xml,sb_xml,ss,se,log):
         ac.loc[(ac["sqk"]>0)&(ac["esk"]==0),"flag"]="Self-bill entry, no dispatch sale"
         ac.loc[(ac["esk"]>10)&(ac["sqk"]==0),"flag"]="Dispatch sale, no self-bill entry"
         ac.loc[(ac["flag"]=="")&(ac["qd"].abs()>10),"flag"]="Qty mismatch"
-        ac.loc[(ac["flag"]=="")&(ac["ed"].abs()>=FLAG_EUR),"flag"]="EUR mismatch"
+        ac.loc[(ac["flag"]=="")&(ac["ed"].abs()>1.0),"flag"]="EUR mismatch"
     af = ac[ac["flag"]!=""].copy()
     ipe=ac["beur"].sum(); ipk=ac["bqk"].sum(); ise=ac["seur"].sum(); isk=ac["sqk"].sum()
     epe=ac["epe"].sum(); epk2=ac["epk"].sum(); ese=ac["ese"].sum(); esk2=ac["esk"].sum()
@@ -628,7 +666,6 @@ def check_vf(df_all,ms,me,ck,log):
     sf=vc["xqm"].replace(0,float("nan")); vc["xdp"]=(vc["xdm"]/sf*100).round(2)
     vc["exc"]=vc["exm"]*up; vc["cd"]=vc["exc"]-vc["xae"]; vc["flag"]=""
     vc.loc[vc["xdp"].abs()>1,"flag"]="\u26a0\ufe0f EXIT"
-    vc.loc[(vc["flag"]=="")&((vc["exc"]*2-vc["tae"]).abs()>=FLAG_EUR),"flag"]="\u26a0\ufe0f EUR"  # v1.11.0: any day with >= 1 EUR difference
     vfl=vc[vc["flag"]!=""]
     iet=vc["xqm"].sum(); eet=vc["exm"].sum(); evdp=(eet-iet)/iet*100 if iet else 0
     igt=vc["tae"].sum(); egt=vc["exc"].sum()*2; gtd=egt-igt
@@ -671,17 +708,27 @@ def check_eic(df_all,ms,me,ck,log):
         # notebook semantics: outer merge, NO fillna; qty_diff_pct divides by raw inv_qty
         cp=iv.merge(ec,on="gas_day",how="outer").sort_values("gas_day").reset_index(drop=True)
         cp["qd"]=cp["eqty"]-cp["iq"]; cp["qdp"]=(cp["qd"]/cp["iq"]*100).round(2)
-        cp["pm"]=(cp["iup"]-cp["ep"]).abs()<0.000001; cp["ea"]=cp["eqty"]*cp["ep"]; cp["ad"]=cp["ea"]-cp["ia"]
+        # v1.13.2: no EEX ZTP price yet for a gas day -> NOT a price mismatch; value Equinor qty at the invoice price
+        # so only the quantity is checked that day (the price table can lag behind the bill)
+        cp["nop"]=cp["ep"].isna()&cp["iup"].notna()
+        cp["pm"]=cp["nop"]|((cp["iup"]-cp["ep"]).abs()<0.000001)
+        cp["epu"]=cp["ep"].where(~cp["nop"],cp["iup"])
+        cp["ea"]=cp["eqty"]*cp["epu"]; cp["ad"]=cp["ea"]-cp["ia"]
         cp["flag"]=""; he=~((cp["eqty"].fillna(0).abs()<0.0001)&(cp["iq"].isna()))
         cp.loc[he&(cp["qdp"].abs()>1),"flag"]="\u26a0\ufe0f QTY"
         cp.loc[he&(~cp["pm"]),"flag"]=cp.loc[he&(~cp["pm"]),"flag"]+" \u26a0\ufe0f PRICE"
-        cp.loc[he&(cp["flag"]=="")&(cp["ad"].abs()>=FLAG_EUR),"flag"]="\u26a0\ufe0f EUR"  # v1.11.0: any day with >= 1 EUR difference
+        # v1.14.0: orange technical flag - no EEX price for the day, quantity matches (so it is not an invoice error)
+        cp.loc[he&cp["nop"]&(cp["flag"]==""),"flag"]="TECHNICAL: no EEX ZTP price for this gas day"
         iqs=iv["iq"].sum(); eqs=cp["eqty"].sum()
         it=iv["ia"].sum(); et=cp["ea"].sum(); ed=et-it
         v="VERIFIED" if (it and abs(ed/it*100)<0.1 and cp["pm"].all()) else "REVIEW REQUIRED"
+        nnp=int(cp["nop"].sum())
+        if v=="VERIFIED" and nnp: v=f"TECHNICAL - no EEX price on {nnp} day(s), quantities verified"
         sr.append(dict(category=cat,line_type="Energy in Cash",invoice_qty=float(iqs),equinor_qty=float(eqs),invoice_eur=it,equinor_eur=et,eur_diff=ed,qty_diff_pct=(eqs-iqs)/iqs*100 if iqs else None,days_flagged=len(cp[cp["flag"]!=""]),price_match=bool(cp["pm"].all()),verdict=v))
         sr[-1]["daily"]=[dict(gas_day=str(r["gas_day"]),invoice_volume=r["iq"],invoice_eur=r["ia"],invoice_price=r["iup"],
-                              equinor_volume=r["eqty"],equinor_eur=r["ea"],equinor_price=r["ep"],flag=r["flag"]) for _,r in cp.iterrows()]
+                              equinor_volume=r["eqty"],equinor_eur=r["ea"],equinor_price=r["ep"],flag=r["flag"],
+                              detail=("No EEX ZTP price for this gas day yet - Equinor EUR valued at the invoice price, only quantity checked" if r["nop"] else None)) for _,r in cp.iterrows()]
+        if cp["nop"].any(): log(f"EiC {cat}: {int(cp['nop'].sum())} gas day(s) without EEX ZTP price (from {cp.loc[cp['nop'],'gas_day'].min()}) - quantity-only check")
         for _,r in cp[cp["flag"]!=""].iterrows():
             fr.append(dict(gas_day=str(r["gas_day"]),category=cat,line_type="Energy in Cash",inv_qty=float(r["iq"]),eq_qty=float(r["eqty"]),qty_diff=float(r["qd"]),qty_diff_pct=float(r["qdp"]),inv_up=float(r["iup"]),eq_price=float(r["ep"]),ieur=float(r["ia"]),eeur=float(r["ea"]),deur=float(r["ad"]),flag=r["flag"].strip()))
     log(f"EiC: {len(sr)} categories, {len(fr)} flags")
@@ -732,7 +779,10 @@ def save_results(lc,lf,als,alf,ahf,vfs,vff,eis,eif,df_all,inv_m,ck,inv_file,ack,
                     invoice_eur=_fl(ie_),invoice_volume=_fl(iv_),equinor_eur=_fl(ee_),equinor_volume=_fl(ev_),diff_eur=_fl(de_),
                     diff_pct=_fl(dp),flag_detail=fd,endur_deal_numbers=dn_ if isinstance(dn_,str) and dn_ else None,run_timestamp=ts)
     for r in lc:
-        ar.append(_u(r["billing_month"],f"LTC {r['line_type']}",f"{r['capacity_type']} {r.get('service_rate_type','')}",r["location"],r["direction"],ie=r["invoice_eur"],iv=r.get("invoice_kwh_h"),ee=r.get("equinor_eur"),ev=r.get("endur_kwh_h"),de=r.get("gap_eur"),dp=r.get("price_gap_pct"),st_=_gs(r.get("equinor_eur"),r.get("gap_eur")),dn=r.get("endur_deal_numbers")))
+        st_=_gs(r.get("equinor_eur"),r.get("gap_eur"))
+        if st_=="OK" and (r.get("capacity_type")=="Interruptible" or r.get("backbill")):  # v1.14.0: yellow notice
+            st_="OK \u00b7 NOTICE: "+("Interruptible" if r.get("capacity_type")=="Interruptible" else "")+(" BackBilling" if r.get("backbill") else "")
+        ar.append(_u(r["billing_month"],f"LTC {r['line_type']}",f"{r['capacity_type']} {r.get('service_rate_type','')}",r["location"],r["direction"],ie=r["invoice_eur"],iv=r.get("invoice_kwh_h"),ee=r.get("equinor_eur"),ev=r.get("endur_kwh_h"),de=r.get("gap_eur"),dp=r.get("price_gap_pct"),st_=st_,dn=r.get("endur_deal_numbers")))
     for f in lf:
         af.append(_f(f["gas_day"],f.get("type","LTC"),f["gas_day"],f.get("location",""),f.get("direction",""),iv=f.get("invoice_value"),ev=f.get("endur_value"),d=f.get("gap"),dp=f.get("gap_pct"),u=f.get("unit",""),fd=f.get("note",""),
                      ie_=f.get("ieur"),iv_=f.get("ivol"),ee_=f.get("eeur"),ev_=f.get("evol"),de_=f.get("deur"),dn_=f.get("dn")))
@@ -892,6 +942,8 @@ def describe_flag(f):
     return s
 
 def _sc(val):
+    if val and "TECHNICAL" in str(val): return f"background-color:{FLAG_COLOURS['technical']}"  # v1.14.0
+    if val and "NOTICE" in str(val): return f"background-color:{FLAG_COLOURS['notice']}"
     if val and ("OK" in str(val) or "VERIFIED" in str(val)): return "background-color:#c8e6c9"
     if val and ("D " in str(val) or "\u0394" in str(val) or "REVIEW" in str(val) or "No" in str(val)): return "background-color:#ffcdd2"
     return ""
@@ -939,9 +991,25 @@ def render_run_summary(lr):
     st.subheader("Verification summary")
     st.caption(f"Run {lr['rid']} \u00b7 {_ts_label(lr['ts'])} \u00b7 {lr['bill']}")
     fl=lr["flags"]
-    if not fl:
-        st.success(f"No flagged issues \u2014 every check matched to within {FLAG_EUR:.0f} EUR.")
-        return
+    st.caption(f"Note: issues are flagged when the difference is more than {FLAG_PCT:.0f} % (capacity, price, quantity). "
+               f"The {FLAG_PCT:.0f} % tolerance is deliberate: flagging every difference produced many ~0 % flags (e.g. October 2026). "
+               "Smaller differences are not listed here but are still shown in the Results tables (gap EUR) and the gas-day breakdown.")
+    # v1.14.0: red issues / orange technical issues / yellow notices
+    lv=[_flag_level(f.get("flag_detail")) for f in fl]
+    tec=[f for f,l in zip(fl,lv) if l=="technical"]; ntc=[f for f,l in zip(fl,lv) if l=="notice"]
+    fl=[f for f,l in zip(fl,lv) if l=="issue"]
+    if not fl: st.success(f"No flagged issues \u2014 every check matched within the {FLAG_PCT:.0f} % tolerance.")
+    def _box(kind,head,items):
+        g=pd.DataFrame(items); g["fd"]=g["flag_detail"].astype(str).str.replace("\u26a0\ufe0f","").str.strip()
+        for c_ in ("location","direction"): g[c_]=g[c_].fillna("") if c_ in g else ""
+        g=g.groupby(["period","type","direction","location","fd"],as_index=False).agg(n=("gas_day","size"),a=("gas_day","min"),b=("gas_day","max"))
+        li="".join(f"<li><b>{x.period}</b> \u00b7 {x.type} {x.direction} {x.location}: {x.fd}"
+                   +(f" \u2014 {x.n} days ({x.a} to {x.b})" if x.n>1 else f" ({x.a})")+"</li>" for x in g.itertuples())
+        st.markdown(f"<div style='background:{FLAG_COLOURS[kind]};padding:10px 14px;border-radius:6px;margin-bottom:8px'>"
+                    f"<b>{head}</b><ul style='margin:4px 0 0 0'>{li}</ul></div>",unsafe_allow_html=True)
+    if tec: _box("technical",f"{len(tec)} technical issue(s) \u2014 data missing or incomplete. What could be checked matches, so this is not an invoice error, but some numbers are not fully verified.",tec)
+    if ntc: _box("notice",f"{len(ntc)} notice(s) \u2014 something unusual on the invoice. The numbers match; just make sure it is expected.",ntc)
+    if not fl: return
     st.error(f"{len(fl)} flagged issue(s) found. Review below, then add comments in the Run History tab.")
     cnt=pd.DataFrame(fl).groupby(["period","type"]).size().reset_index(name="flags")
     cnt["period"]=pd.Categorical(cnt["period"],["M","M-1","M-3","Alloc"],ordered=True)
@@ -1018,25 +1086,31 @@ def _endur_calc(raw):
     if len(c)==0: return
     c["s"]=pd.to_datetime(c["start_date"]).dt.date; c["e"]=pd.to_datetime(c["end_date"]).dt.date
     c["hours"]=[_period_hours(s,e) for s,e in zip(c["s"],c["e"])]
+    c["dsf"]=[((e-s).days+1)*24.0/h if h else 1.0 for s,e,h in zip(c["s"],c["e"],c["hours"])]  # v1.13.3
     c["kwh"]=-c["calculated_profile_volume_kwh"]          # Endur stores buys negative: flip so buys are +
     c["kwh_h"]=c["kwh"]/c["hours"]
     big=c["price"].abs()>=0.01
     c["price_unit"]=big.map({True:"EUR/MWh",False:"EUR/kWh"})
     c["eur"]=c["kwh"]*c["price"]/big.map({True:1000.0,False:1.0})
     c["eur_mwh"]=c["price"].where(big,c["price"]*1000)
-    v=c[["deal_number","reference","buy_sell_name","start_date","end_date","hours","kwh","kwh_h","price","price_unit","eur_mwh","eur"]].copy()
+    dst_=bool((c["dsf"]!=1).any()); c["eur_day"]=c["eur"]*c["dsf"]
+    v=c[["deal_number","reference","buy_sell_name","start_date","end_date","hours","kwh","kwh_h","price","price_unit","eur_mwh","eur"]+(["eur_day"] if dst_ else [])].copy()
     v["deal_number"]=v["deal_number"].astype(str)
     tot=dict(deal_number="Net",reference="",buy_sell_name="",start_date="",end_date="",hours=None,kwh=c["kwh"].sum(),
              kwh_h=c["kwh_h"].sum(),price=None,price_unit="",eur_mwh=(c["eur"].sum()/c["kwh"].sum()*1000 if c["kwh"].sum() else None),eur=c["eur"].sum())
+    if dst_: tot["eur_day"]=c["eur_day"].sum()
     v=pd.concat([v,pd.DataFrame([tot])],ignore_index=True)
     v=v.rename(columns={"deal_number":"Deal","reference":"Reference","buy_sell_name":"Buy/Sell","start_date":"From","end_date":"To",
-        "hours":"Hours","kwh":"Volume kWh","kwh_h":"Capacity kWh/h","price":"Endur price","price_unit":"Price unit","eur_mwh":"Price EUR/MWh","eur":"EUR"})
+        "hours":"Hours","kwh":"Volume kWh","kwh_h":"Capacity kWh/h","price":"Endur price","price_unit":"Price unit","eur_mwh":"Price EUR/MWh","eur":"EUR",
+        "eur_day":"EUR (Fluxys day basis)"})
     st.markdown("**How the Equinor side is calculated** (priced rows only, netted)")
-    st.dataframe(v.style.format({"Hours":"{:,.0f}","Volume kWh":"{:,.0f}","Capacity kWh/h":"{:,.0f}","Endur price":"{:,.9f}","Price EUR/MWh":"{:,.6f}","EUR":"{:,.2f}"},na_rep="")
+    st.dataframe(v.style.format({"Hours":"{:,.0f}","Volume kWh":"{:,.0f}","Capacity kWh/h":"{:,.0f}","Endur price":"{:,.9f}","Price EUR/MWh":"{:,.6f}","EUR":"{:,.2f}","EUR (Fluxys day basis)":"{:,.2f}"},na_rep="")
                  .apply(lambda r:["font-weight:bold;background-color:#eeeeee"]*len(r) if r["Deal"]=="Net" else [""]*len(r),axis=1),
                  use_container_width=True,hide_index=True)
     st.caption("Volume = calculated_profile_volume_kwh with buys + and sells \u2212. Capacity = volume \u00f7 gas-day hours in the period. "
                "EUR = volume \u00d7 price (\u00f7 1000 when the price is EUR/MWh, i.e. OCUC/bilateral deals; PRISMA deals are EUR/kWh). "
+               +("Clock-change month: Endur counts the 23 h / 25 h gas day by the hour, Fluxys bills it as a full day, so the check "
+                 "compares EUR (Fluxys day basis) = EUR \u00d7 (days \u00d7 24) \u00f7 hours. " if dst_ else "")+
                "A buy and a sell of the same capacity at the same price cancel out. Zero-price PRI_SEC sell-backs (Virtualys) "
                "are not listed here; the check values them at the average price.")
 
@@ -1217,6 +1291,9 @@ def _deal_contrib(raw, bill_eur_mwh):
     c=raw[(raw["settlement_type_id"].astype(str)=="1")&(raw["price"]!=0)].copy()
     if len(c)==0: return None
     c["mwh"]=-c["calculated_profile_volume_kwh"].astype(float)/1000
+    # v1.13.3: put Endur energy on the Fluxys per-day basis (24 h per day) so a 23 h / 25 h gas day is not a gap
+    _s=pd.to_datetime(c["start_date"]).dt.date; _e=pd.to_datetime(c["end_date"]).dt.date
+    c["mwh"]=c["mwh"]*[((e-s).days+1)*24.0/_period_hours(s,e) for s,e in zip(_s,_e)]
     c["eur_mwh"]=c["price"].where(c["price"].abs()>=0.01,c["price"]*1000)
     c["reference"]=c["reference"].fillna(""); c["buy_sell_name"]=c["buy_sell_name"].fillna("")
     g=c.groupby(["deal_number","reference","buy_sell_name","eur_mwh"],as_index=False,dropna=False)["mwh"].sum()
@@ -1235,7 +1312,7 @@ def _reconcile(row,d,raw=None,show=True):
     ms,me=_month_bounds(row.get("billing_month"))
     if len(lt)==0 or ms is None: return False
     inv_mwh=float((lt["qty"]*lt["bill_p"]*24).sum())/1000
-    end_mwh=float(ev)*_period_hours(ms,me)/1000
+    end_mwh=float(ev)*((me-ms).days+1)*24/1000  # v1.13.3: Fluxys per-day basis (24 h/day) on both sides
     if not inv_mwh: return False
     ip=float(ie)/inv_mwh; ep=float(ee)/end_mwh; yr=float(lt["unit_p"].dropna().iloc[0]) if lt["unit_p"].notna().any() else 365.0
     ups=sorted(lt["unit_price"].dropna().unique())
@@ -1297,7 +1374,7 @@ def _reconcile(row,d,raw=None,show=True):
             st.warning("Prices match; the gap is volume \u2014 compare the Endur deals and Invoice lines sections.")
         else:
             st.warning(f"Both volume and price differ \u2014 see the effects above.{tariff}")
-        st.caption("Invoice energy = \u03a3 QTY \u00d7 BILLp \u00d7 24 h. Endur energy = Endur kWh/h \u00d7 gas-day hours in the month (23/25 h on clock-change days). "
+        st.caption("Invoice energy = \u03a3 QTY \u00d7 BILLp \u00d7 24 h. Endur energy = Endur kWh/h \u00d7 days \u00d7 24 h (Fluxys bills per day, so 23 h / 25 h clock-change days count as 24 h on both sides). "
                    "Volume effect + price effect = the gap exactly. The comment above is chosen by fixed rules on these numbers.")
     return rec
 
@@ -1402,13 +1479,15 @@ def render_daily_panel(row, mf, key):
             return
         d=to_num(d,_DAILY_NUM); unit=str(d["unit"].dropna().iloc[0]) if d["unit"].notna().any() else ""
         d["flag"]=d["flag"].fillna("")
-        nflag=int((d["flag"]!="").sum())
-        only=st.toggle(f"Only flagged days ({nflag})",value=False,key=key+"_only")
+        d["lvl"]=d["flag"].map(_flag_level)
+        nflag=int((d["flag"]!="").sum()); ni=int((d["lvl"]=="issue").sum()); nt=int((d["lvl"]=="technical").sum()); nn=int((d["lvl"]=="notice").sum())
+        lab=", ".join(x for x in [f"{ni} issue(s)" if ni else "",f"{nt} technical" if nt else "",f"{nn} notice(s)" if nn else ""] if x) or "0"
+        only=st.toggle(f"Only flagged days ({lab})",value=False,key=key+"_only")
         cap_=item.startswith("Capacity")
         if "detail" not in d.columns: d["detail"]=None
         v=d[["flag","gas_day"]+_DAILY_NUM+["detail"]].copy()
         if only: v=v[v["flag"]!=""]
-        if not cap_ or v["detail"].isna().all(): v=v.drop(columns=["detail"])
+        if v["detail"].isna().all(): v=v.drop(columns=["detail"])  # v1.13.2: also shown for EiC days without a price
         if len(v):
             s_=lambda c: v[c].sum(min_count=1)
             iv,ie,ev,ee=s_("invoice_volume"),s_("invoice_eur"),s_("equinor_volume"),s_("equinor_eur")
@@ -1422,11 +1501,12 @@ def render_daily_panel(row, mf, key):
         disp,ncd,_=for_display(v,_DAILY_NUM)
         fmt={c:("{:,.6f}" if "Price" in c else "{:,.2f}") for c in ncd}
         def _rs(r):
-            if str(r["Flag"] or "")!="": return ["background-color:#ffcdd2"]*len(r)
+            if str(r["Flag"] or "")!="": return [f"background-color:{FLAG_COLOURS.get(_flag_level(r['Flag']),'#ffcdd2')}"]*len(r)
             if str(r["Gas Day"]).startswith(("Total","Average")): return ["font-weight:bold;background-color:#eeeeee"]*len(r)
             return [""]*len(r)
         st.dataframe(disp.style.format(fmt,na_rep="").apply(_rs,axis=1),use_container_width=True,hide_index=True)
-        st.caption(f"Volumes in {unit}, prices in EUR per {unit}. Red = flagged day. The Total row adds up to the monthly figure in the summary"
+        st.caption(f"Volumes in {unit}, prices in EUR per {unit}. Red = numbers do not match; orange = technical issue (data missing, what can be checked matches); "
+                   "yellow = notice (unusual, numbers match). The Total row adds up to the monthly figure in the summary"
                    +(" (ZTP Trading: Entry + Exit; Equinor = exit x 2)." if item=="ZTP Trading" else ".")
                    +" Always shows the latest run for the month.")
 
@@ -1564,11 +1644,17 @@ def _pair_register():
     1) same allocation settlement month on both (closest invoice date wins);
     2) bill without allocation lines: self-bill with the SAME invoice date (Fluxys issues both together);
     3) otherwise: self-bill whose settlement month = bill month - 3.
-    Self-bills without allocation settlement sales are never paired. Only writes changes."""
+    Self-bills without allocation settlement sales are never paired automatically. Only writes changes.
+    v1.15.0: manual pairs (pair_method='manual', set with the Pair button on the Upload tab) are kept and never re-done."""
     r=run_sql(f"SELECT invoice_number,invoice_type,invoice_date,applies_to_month,alloc_settlement_month,paired_invoice_number,pair_method FROM {SCHEMA}.invoice_register")
     if len(r)==0: return
     b=r[r["invoice_type"]=="Bill"]; s=r[(r["invoice_type"]=="Self-Bill")&r["alloc_settlement_month"].notna()]
     want={}; how={}; used=set()
+    ty=dict(zip(r["invoice_number"],r["invoice_type"]))
+    for _,x in r[(r["invoice_type"]=="Bill")&(r["pair_method"]=="manual")].iterrows():   # 0) manual pairs first
+        bn,sn=x["invoice_number"],x["paired_invoice_number"]
+        if sn and ty.get(sn)=="Self-Bill" and sn not in used:
+            want[bn]=sn; want[sn]=bn; how[bn]=how[sn]="manual"; used.add(sn)
     def _take(bn,c,method):
         c=c[~c["invoice_number"].isin(used)]
         if len(c)==0: return False
@@ -1577,7 +1663,7 @@ def _pair_register():
         sn=c.iloc[0]["invoice_number"]; used.add(sn)
         want[bn]=sn; want[sn]=bn; how[bn]=how[sn]=method; return True
     for _,x in b.iterrows():   # 1) settlement month on both
-        if x["alloc_settlement_month"]: _take(x["invoice_number"],s[s["alloc_settlement_month"]==x["alloc_settlement_month"]],"same settlement month")
+        if x["alloc_settlement_month"] and x["invoice_number"] not in want: _take(x["invoice_number"],s[s["alloc_settlement_month"]==x["alloc_settlement_month"]],"same settlement month")
     for _,x in b.iterrows():   # 2) + 3) bills without allocation lines
         bn=x["invoice_number"]
         if bn in want or x["alloc_settlement_month"]: continue
@@ -1588,6 +1674,77 @@ def _pair_register():
         n=x["invoice_number"]; w=want.get(n); hw=how.get(n)
         if w!=(x["paired_invoice_number"] or None) or hw!=(x["pair_method"] or None):
             exec_sql(f"UPDATE {SCHEMA}.invoice_register SET paired_invoice_number={sql_lit(w)},pair_method={sql_lit(hw)} WHERE invoice_number={sql_lit(n)}")
+
+def _manual_pair(bn, sn):
+    """v1.15.0: pair bill bn with self-bill sn by hand. Old partners of either side are released (in one statement),
+    then the automatic pairing is re-run so a released invoice can find another partner."""
+    b_,s_=sql_lit(bn),sql_lit(sn)
+    exec_sql(f"UPDATE {SCHEMA}.invoice_register SET "
+             f"paired_invoice_number=CASE WHEN invoice_number={b_} THEN {s_} WHEN invoice_number={s_} THEN {b_} ELSE NULL END, "
+             f"pair_method=CASE WHEN invoice_number IN ({b_},{s_}) THEN 'manual' ELSE NULL END "
+             f"WHERE invoice_number IN ({b_},{s_}) OR paired_invoice_number IN ({b_},{s_})")
+    _pair_register()
+
+def _manual_unpair(bn, sn):
+    """v1.15.1: remove a manual pair, then re-run the automatic pairing for both invoices.
+    Returns {invoice_number: (new partner or None, pair_method)} for the two invoices."""
+    b_,s_=sql_lit(bn),sql_lit(sn)
+    exec_sql(f"UPDATE {SCHEMA}.invoice_register SET paired_invoice_number=NULL,pair_method=NULL "
+             f"WHERE invoice_number IN ({b_},{s_}) AND pair_method='manual'")
+    _pair_register()
+    r=run_sql(f"SELECT invoice_number,paired_invoice_number,pair_method FROM {SCHEMA}.invoice_register WHERE invoice_number IN ({b_},{s_})")
+    return {x["invoice_number"]:(x["paired_invoice_number"] or None,x["pair_method"] or None) for _,x in r.iterrows()}
+
+def _unpair_box(bn, sn):
+    """v1.15.1: Unpair button for a manual bill / self-bill pair."""
+    with st.container(border=True):
+        st.markdown(f"Bill **{bn}** and self-bill **{sn}** are paired **by hand**. Unpair them?")
+        st.caption("Both go back to the automatic pairing (same settlement month \u2192 same invoice date \u2192 settlement = bill month - 3), "
+                   "so they may be paired again automatically, or with other invoices, if the rules match.")
+        if st.button("Unpair",key=f"unpair_{bn}_{sn}"):
+            res=_manual_unpair(bn,sn)
+            def _d(n,kind):
+                p,h=res.get(n,(None,None))
+                return f"{kind} {n}: "+(f"now paired automatically with {p} ({h})" if p else "not paired")
+            st.session_state["pair_msg"]=f"Unpaired bill {bn} and self-bill {sn}. "+_d(bn,"Bill")+"; "+_d(sn,"self-bill")+"."
+            st.session_state["reg_sel_k"]=st.session_state.get("reg_sel_k",0)+1   # clears the row selection
+            st.rerun()
+
+def _pair_selection(meta, rows):
+    """v1.15.0: Pair button for two selected Invoice Register rows (must be one bill + one self-bill).
+    v1.15.1: Unpair button when the selection is (one side of) a manual pair."""
+    _s=lambda v: v if isinstance(v,str) and v else None   # NULL / NaN / "" -> None
+    if len(rows)==1:
+        x={k:_s(v) for k,v in meta.iloc[rows[0]].to_dict().items()}
+        if x["pair_method"]=="manual" and x["paired_invoice_number"]:
+            bn,sn=(x["invoice_number"],x["paired_invoice_number"]) if x["invoice_type"]=="Bill" else (x["paired_invoice_number"],x["invoice_number"])
+            _unpair_box(bn,sn)
+        st.caption("Select one more row (a bill and a self-bill) to pair them by hand."); return
+    if len(rows)>2:
+        st.info("Select exactly two rows \u2014 one bill and one self-bill \u2014 to pair them."); return
+    a,b_=[{k:_s(v) for k,v in meta.iloc[i].to_dict().items()} for i in rows]
+    if {a["invoice_type"],b_["invoice_type"]}!={"Bill","Self-Bill"}:
+        why=f" (you selected two {a['invoice_type'].lower()}s)" if a["invoice_type"] and a["invoice_type"]==b_["invoice_type"] else ""
+        st.warning(f"Cannot pair: select one **bill** and one **self-bill**{why}."); return
+    bl,sb=(a,b_) if a["invoice_type"]=="Bill" else (b_,a)
+    bn,sn=bl["invoice_number"],sb["invoice_number"]
+    if bl["paired_invoice_number"]==sn:
+        if bl["pair_method"]=="manual": _unpair_box(bn,sn); return
+        st.info(f"Bill {bn} and self-bill {sn} are already paired ({bl['pair_method'] or 'automatic'})."); return
+    nt=[]
+    if bl["paired_invoice_number"]: nt.append(f"bill {bn} is now paired with self-bill {bl['paired_invoice_number']} \u2014 that pairing will be removed")
+    if sb["paired_invoice_number"]: nt.append(f"self-bill {sn} is now paired with bill {sb['paired_invoice_number']} \u2014 that pairing will be removed")
+    if not sb["alloc_settlement_month"]: nt.append("the self-bill has no allocation settlement sales, so the check will not use it")
+    elif bl["alloc_settlement_month"] and bl["alloc_settlement_month"]!=sb["alloc_settlement_month"]:
+        nt.append(f"allocation settlement months differ (bill {bl['alloc_settlement_month']}, self-bill {sb['alloc_settlement_month']})")
+    with st.container(border=True):
+        st.markdown(f"Pair **bill {bn}** with **self-bill {sn}**?")
+        for n_ in nt: st.markdown("\u26a0\ufe0f "+n_[0].upper()+n_[1:]+".")
+        if st.button("Pair",key=f"pair_{bn}_{sn}",type="primary"):
+            _manual_pair(bn,sn)
+            st.session_state["pair_msg"]=f"Paired bill {bn} with self-bill {sn} (manual). This pairing is kept when new files are uploaded."
+            st.session_state["reg_sel_k"]=st.session_state.get("reg_sel_k",0)+1   # clears the row selection
+            st.rerun()
 
 def _upload_one(fname, raw):
     """Store one uploaded XML. Returns (level, message)."""
@@ -1669,6 +1826,9 @@ with t1:
     if not st.session_state.get("reg_synced"):  # once per session (plus after uploads): fill old rows + refresh pairing
         _backfill_register(); _pair_register(); st.session_state["reg_synced"]=True
     st.subheader("Invoice Register")
+    if st.session_state.get("pair_msg"):
+        st.success(st.session_state["pair_msg"])
+        if st.button("Clear message",key="pair_clear"): st.session_state["pair_msg"]=""; st.rerun()
     reg=run_sql(f"SELECT file_name,invoice_type,invoice_number,invoice_date,invoice_month,applies_to_month,alloc_settlement_month,paired_invoice_number,pair_method,"
                 f"document_type,has_backbilling,net_amount_eur,uploaded_by,uploaded_at FROM {SCHEMA}.invoice_register")
     if len(reg)>0:
@@ -1682,7 +1842,9 @@ with t1:
             else:
                 ap=bm_.get(p) if p else None
                 hw_=f" ({x['pair_method']})" if p and x["pair_method"] else ""
-                pr=(("Paired \u00b7 bill "+p+hw_) if p else "Waiting for its bill") if x["alloc_settlement_month"] else "Not used by the check (no allocation settlement sales)"
+                pr=((("Paired \u00b7 bill "+p+hw_) if p else "Waiting for its bill") if x["alloc_settlement_month"]
+                    else ("Paired \u00b7 bill "+p+hw_+" \u00b7 not used by the check (no allocation settlement sales)") if p
+                    else "Not used by the check (no allocation settlement sales)")
             nt=[]
             if x["document_type"] not in (None,"","Invoice"): nt.append(x["document_type"])
             if str(x["has_backbilling"]).lower()=="true": nt.append("BackBilling lines")
@@ -1693,16 +1855,22 @@ with t1:
         reg["_ts"]=pd.to_datetime(reg["uploaded_at"],errors="coerce",utc=True)
         reg=reg.sort_values(["_ts","invoice_type"],ascending=[False,True],na_position="last")  # v1.10.4: most recently uploaded first
         reg["uploaded_at"]=reg["uploaded_at"].apply(lambda v:_ts_label(v) if v else "")
+        meta=reg[["invoice_number","invoice_type","paired_invoice_number","pair_method","alloc_settlement_month"]].reset_index(drop=True)  # v1.15.0: for the Pair button
         reg=reg[["file_name","invoice_type","invoice_number","applies_to","pairing","alloc_settlement_month","invoice_date","notes",
                  "net_amount_eur","uploaded_by","uploaded_at"]]
         hl=reg["invoice_number"].isin(set(newn)).tolist()
         reg=to_num(reg,["net_amount_eur"]).reset_index(drop=True); reg,_,_=for_display(reg)
         fm={c:"{:,.2f}" for c in reg.columns if "net" in c.lower()}
-        st.dataframe(reg.style.format(fm,na_rep="").apply(lambda r:["background-color:#c8e6c9"]*len(r) if hl[r.name] else [""]*len(r),axis=1),
-                     use_container_width=True,hide_index=True)
+        ev=st.dataframe(reg.style.format(fm,na_rep="").apply(lambda r:["background-color:#c8e6c9"]*len(r) if hl[r.name] else [""]*len(r),axis=1),
+                        use_container_width=True,hide_index=True,on_select="rerun",selection_mode="multi-row",
+                        key=f"reg_sel_{st.session_state.get('reg_sel_k',0)}")
+        rows_=list(ev.selection.rows) if ev is not None and getattr(ev,"selection",None) else []
+        if rows_: _pair_selection(meta,rows_)
         st.caption("Newest uploads at the top; green = just uploaded. Applies to = the invoice month the bill is checked as (latest capacity billing month on the bill); "
                    "a self-bill shows its paired bill's month, or its invoice-date month if it has no bill. "
-                   "Bill and self-bill are paired on the allocation settlement month inside the files.")
+                   "Bill and self-bill are paired on the allocation settlement month inside the files. "
+                   "If the automatic pairing is wrong or missing, tick one bill and one self-bill and click Pair (shown as 'manual'). "
+                   "Tick a manually paired row to Unpair it (it goes back to the automatic pairing).")
     else: st.info("No invoices uploaded yet.")
 
 with t2:
@@ -1982,12 +2150,10 @@ with t5:
              "Diff \u20ac":"diff_eur","Diff %":"diff_pct"}
         sel_items=st.multiselect("Variable cost items",items,default=items,placeholder="All items")
         sel_items=sel_items or items  # nothing picked = show all
-        c1,c2=st.columns([3,1])
-        mets=c1.multiselect("Show",list(MET),default=["Invoice volume","Invoice \u20ac","Equinor volume","Equinor \u20ac","Diff \u20ac"])
-        thr=c2.number_input("Highlight month-on-month change above (%)",min_value=0.0,value=20.0,step=5.0)
+        mets=st.multiselect("Show",list(MET),default=["Invoice volume","Invoice \u20ac","Equinor volume","Equinor \u20ac","Diff \u20ac"])
         months=sorted(ovd["check_month"].unique())
         wide=pd.DataFrame(index=[_fmt_month(m) for m in months])
-        mom_cols,price_cols,pct_cols=[],[],[]
+        price_cols,pct_cols=[],[]
         for it in sel_items:
             sub=ovd[ovd["item"]==it].drop_duplicates("check_month").set_index("check_month")
             unit=str(sub["volume_unit"].dropna().iloc[0]) if sub["volume_unit"].notna().any() else ""
@@ -1996,18 +2162,15 @@ with t5:
                 if it=="Total variable cost" and ("volume" in col or "price" in col): continue
                 lab=f"{it} \u00b7 {m}"+(f" ({unit})" if "volume" in col else (f" (\u20ac/{unit})" if "price" in col else ""))
                 wide[lab]=sub[col].reindex(months).values
-                if col in ("invoice_volume","invoice_eur","invoice_price","equinor_volume","equinor_eur","equinor_price"): mom_cols.append(lab)
                 if "price" in col: price_cols.append(lab)
                 if col=="diff_pct": pct_cols.append(lab)
-        # month-on-month change vs the previous month shown in the table
-        hi=pd.DataFrame("",index=wide.index,columns=wide.columns)
-        for c in mom_cols:
-            prev=wide[c].shift(1); chg=(wide[c]-prev)/prev.abs()
-            hi.loc[(chg.abs()>thr/100).fillna(False).values,c]="background-color:#ffe0b2"
+        # v1.14.3: month-on-month orange highlight removed from the Overview table
         numc=list(wide.columns)
         fmt={c:("{:,.6f}" if c in price_cols else "{:,.2f}") for c in numc}
-        st.dataframe(wide.style.format(fmt,na_rep="").apply(lambda _:hi,axis=None),use_container_width=True)
-        st.caption(f"Orange = changed by more than {thr:.0f}% versus the previous month in the table. Volume units: kWh (Alloc, Energy in Cash), MWh (ZTP Trading, Entry + Exit).")
+        # v1.14.5: month labels as a real "Invoice month" column (header shown) instead of an unnamed index
+        wide=wide.rename_axis("Invoice month").reset_index()
+        st.dataframe(wide.style.format(fmt,na_rep=""),use_container_width=True,hide_index=True)
+        st.caption("Volume units: kWh (Alloc, Energy in Cash), MWh (ZTP Trading, Entry + Exit).")
         st.subheader("Item trend")
         it=st.selectbox("Item",items,index=items.index("Total variable cost") if "Total variable cost" in items else 0)
         sub=ovd[ovd["item"]==it].drop_duplicates("check_month").sort_values("check_month").copy()
@@ -2019,4 +2182,4 @@ with t5:
         tv=tv.rename(columns={"check_month":"invoice_month"})
         tn=["invoice_volume","invoice_eur","invoice_eur_change_pct","equinor_volume","equinor_eur","diff_eur","diff_pct"]
         tv,tn2,ts2=for_display(tv,tn,["status"])
-        st.dataframe(styled(tv,tn2,ts2),use_container_width=True,hide_index=True)
+        st.dataframe(styled(tv,tn2),use_container_width=True,hide_index=True)  # v1.14.4: no status colours on Overview Item trend
